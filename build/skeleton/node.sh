@@ -41,7 +41,8 @@ echo_ok()
 
 update_script()
 {
-    local SCRIPT_URL=https://raw.githubusercontent.com/elastos/Elastos.Node/master/build/skeleton/node.sh
+    #local SCRIPT_URL=https://raw.githubusercontent.com/elastos/Elastos.Node/master/build/skeleton/node.sh
+    local SCRIPT_URL=https://raw.githubusercontent.com/MButcho/Elastos.Node/master/build/skeleton/node.sh
 
     local SCRIPT=$SCRIPT_PATH/$(basename $BASH_SOURCE)
     local SCRIPT_TMP=$SCRIPT.tmp
@@ -2089,14 +2090,20 @@ esc_start()
             --pbft.net.address '$(extip)' \
             --pbft.net.port 20639 \
             --rpc \
-            --rpcaddr '0.0.0.0' \
+            --rpcaddr '127.0.0.1' \
+            --rpccorsdomain '*' \
+            --rpcport '8545' \
             --rpcapi 'db,eth,net,pbft,personal,txpool,web3' \
             --rpcvhosts '*' \
             --syncmode full \
             --unlock '0x$(cat $SCRIPT_PATH/esc/data/keystore/UTC* | jq -r .address)' \
             --ws \
-            --wsaddr '0.0.0.0' \
+            --wsaddr '127.0.0.1' \
+            --wsport '8546' \
             --wsorigins '*' \
+            --wsapi 'web3, eth' \
+            --maxpeers=100 \
+            --cache=4096 \
             2>&1 \
             | rotatelogs $SCRIPT_PATH/esc/logs/esc-%Y-%m-%d-%H_%M_%S.log 20M" &
     else
@@ -2105,12 +2112,16 @@ esc_start()
             --datadir $SCRIPT_PATH/esc/data \
             --lightserv 10 \
             --rpc \
-            --rpcaddr '0.0.0.0' \
-            --rpcapi 'admin,eth,net,txpool,web3' \
+            --rpcaddr '127.0.0.1' \
+            --rpccorsdomain '*' \
+            --rpcport '8545'
+            --rpcapi 'db,eth,net,pbft,personal,txpool,web3' \
             --rpcvhosts '*' \
             --ws \
-            --wsaddr '0.0.0.0' \
+            --wsaddr '127.0.0.1' \
+            --wsport 8546
             --wsorigins '*' \
+            --wsapi 'web3, eth' \
             2>&1 \
             | rotatelogs $SCRIPT_PATH/esc/logs/esc-%Y-%m-%d-%H_%M_%S.log 20M" &
     fi
@@ -2184,7 +2195,7 @@ esc_jsonrpc()
     fi
 
     curl -s -H 'Content-Type:application/json' -X POST --data $DATA \
-        http://127.0.0.1:20636 | jq .
+        http://127.0.0.1:8545 | jq .
 }
 
 esc_status()
