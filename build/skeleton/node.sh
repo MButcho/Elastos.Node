@@ -2090,16 +2090,14 @@ esc_start()
             --pbft.net.address '$(extip)' \
             --pbft.net.port 20639 \
             --rpc \
-            --rpcaddr '127.0.0.1' \
+            --rpcaddr '0.0.0.0' \
             --rpccorsdomain '*' \
-            --rpcport '8545' \
             --rpcapi 'db,eth,net,pbft,personal,txpool,web3' \
             --rpcvhosts '*' \
             --syncmode full \
             --unlock '0x$(cat $SCRIPT_PATH/esc/data/keystore/UTC* | jq -r .address)' \
             --ws \
-            --wsaddr '127.0.0.1' \
-            --wsport '8546' \
+            --wsaddr '0.0.0.0' \
             --wsorigins '*' \
             --wsapi 'web3, eth' \
             --maxpeers=100 \
@@ -2112,14 +2110,12 @@ esc_start()
             --datadir $SCRIPT_PATH/esc/data \
             --lightserv 10 \
             --rpc \
-            --rpcaddr '127.0.0.1' \
+            --rpcaddr '0.0.0.0' \
             --rpccorsdomain '*' \
-            --rpcport '8545'
-            --rpcapi 'db,eth,net,pbft,personal,txpool,web3' \
+            --rpcapi 'admin,db,eth,net,pbft,personal,txpool,web3' \
             --rpcvhosts '*' \
             --ws \
-            --wsaddr '127.0.0.1' \
-            --wsport 8546
+            --wsaddr '0.0.0.0' \
             --wsorigins '*' \
             --wsapi 'web3, eth' \
             2>&1 \
@@ -2195,7 +2191,7 @@ esc_jsonrpc()
     fi
 
     curl -s -H 'Content-Type:application/json' -X POST --data $DATA \
-        http://127.0.0.1:8545 | jq .
+        http://127.0.0.1:20636 | jq .
 }
 
 esc_status()
