@@ -714,8 +714,8 @@ all_start()
     eid-oracle_installed && eid-oracle_start
     eco_installed        && eco_start
     eco-oracle_installed && eco-oracle_start
-    pgp_installed        && pgp_start
-    pgp-oracle_installed && pgp-oracle_start
+    #pgp_installed        && pgp_start
+    #pgp-oracle_installed && pgp-oracle_start
     pg_installed         && pg_start
     pg-oracle_installed  && pg-oracle_start
     arbiter_installed    && arbiter_start
@@ -730,8 +730,8 @@ all_stop()
     esc-oracle_installed && esc-oracle_stop
     esc_installed        && esc_stop
     eco-oracle_installed && eco-oracle_stop
-    pgp_installed        && pgp_stop
-    pgp-oracle_installed && pgp-oracle_stop
+    #pgp_installed        && pgp_stop
+    #pgp-oracle_installed && pgp-oracle_stop
     pg_installed         && pg_stop
     pg-oracle_installed  && pg-oracle_stop
     eco_installed        && eco_stop
@@ -746,8 +746,8 @@ all_status()
     eid-oracle_installed && eid-oracle_status
     eco_installed        && eco_status
     eco-oracle_installed && eco-oracle_status
-    pgp_installed        && pgp_status
-    pgp-oracle_installed && pgp-oracle_status
+    #pgp_installed        && pgp_status
+    #pgp-oracle_installed && pgp-oracle_status
     pg_installed         && pg_status
     pg-oracle_installed  && pg-oracle_status
     arbiter_installed    && arbiter_status
@@ -762,8 +762,8 @@ all_update()
     eid-oracle_installed && eid-oracle_update
     eco_installed        && eco_update
     eco-oracle_installed && eco-oracle_update
-    pgp_installed        && pgp_update
-    pgp-oracle_installed && pgp-oracle_update
+    #pgp_installed        && pgp_update
+    #pgp-oracle_installed && pgp-oracle_update
     pg_installed         && pg_update
     pg-oracle_installed  && pg-oracle_update
     arbiter_installed    && arbiter_update
@@ -778,8 +778,8 @@ all_init()
     eid-oracle_init
     eco_init
     eco-oracle_init
-    pgp_init
-    pgp-oracle_init
+    #pgp_init
+    #pgp-oracle_init
     pg_init
     pg-oracle_init
     arbiter_init
@@ -794,8 +794,8 @@ all_compress_log()
     eid-oracle_installed && eid-oracle_compress_log
     eco_installed        && eco_compress_log
     eco-oracle_installed && eco-oracle_compress_log
-    pgp_installed        && pgp_compress_log
-    pgp-oracle_installed && pgp-oracle_compress_log
+    #pgp_installed        && pgp_compress_log
+    #pgp-oracle_installed && pgp-oracle_compress_log
     pg_installed         && pg_compress_log
     pg-oracle_installed  && pg-oracle_compress_log
     arbiter_installed    && arbiter_compress_log
@@ -810,8 +810,8 @@ all_remove_log()
     eid-oracle_installed && eid-oracle_remove_log
     eco_installed        && eco_remove_log
     eco-oracle_installed && eco-oracle_remove_log
-    pgp_installed        && pgp_remove_log
-    pgp-oracle_installed && pgp-oracle_remove_log
+    #pgp_installed        && pgp_remove_log
+    #pgp-oracle_installed && pgp-oracle_remove_log
     pg_installed         && pg_remove_log
     pg-oracle_installed  && pg-oracle_remove_log
     arbiter_installed    && arbiter_remove_log
@@ -5106,20 +5106,22 @@ arbiter_status()
     # linda 添加
 
     # linda 添加PGP
-    if [ "$CHAIN_TYPE" == "mainnet" ]; then
-        local PGP_GENESIS=00b7957fbc9fa62e86d6e664299bebc9a939f108fd015f8de07ce33f4136175e
-    elif [ "$CHAIN_TYPE" == "testnet" ]; then
-        local PGP_GENESIS=0c2785b9c5bee92aaaa3d8e5a7a579347a9091c6c8c19b7cba7fac69519c58a1
-    else
-        echo_error "do not support $CHAIN_TYPE"
-        return
-    fi
-    local ARBITER_PGP_HEIGHT=$(arbiter_jsonrpc \
-        "{\"method\":\"getsidechainblockheight\",\"params\":{\"hash\":\"$PGP_GENESIS\"}}" \
-        | jq -r '.result')
-    if [[ ! "$ARBITER_PGP_HEIGHT" =~ ^[0-9]+$ ]]; then
-        ARBITER_PGP_HEIGHT=N/A
-    fi
+
+    #if [ "$CHAIN_TYPE" == "mainnet" ]; then
+    #    local PGP_GENESIS=00b7957fbc9fa62e86d6e664299bebc9a939f108fd015f8de07ce33f4136175e
+    #elif [ "$CHAIN_TYPE" == "testnet" ]; then
+    #    local PGP_GENESIS=0c2785b9c5bee92aaaa3d8e5a7a579347a9091c6c8c19b7cba7fac69519c58a1
+    #else
+    #    echo_error "do not support $CHAIN_TYPE"
+    #    return
+    #fi
+    #local ARBITER_PGP_HEIGHT=$(arbiter_jsonrpc \
+    #    "{\"method\":\"getsidechainblockheight\",\"params\":{\"hash\":\"$PGP_GENESIS\"}}" \
+    #    | jq -r '.result')
+    #if [[ ! "$ARBITER_PGP_HEIGHT" =~ ^[0-9]+$ ]]; then
+    #    ARBITER_PGP_HEIGHT=N/A
+    #fi
+
     # linda 添加
 
     # linda 添加PG
@@ -5153,7 +5155,7 @@ arbiter_status()
     # linda 添加
     status_info "ECO Height" "$ARBITER_ECO_HEIGHT"
     # linda 添加
-    status_info "PGP Height" "$ARBITER_PGP_HEIGHT"
+    #status_info "PGP Height" "$ARBITER_PGP_HEIGHT"
     # linda 添加
     status_info "PG Height" "$ARBITER_PG_HEIGHT"
     echo
@@ -5270,6 +5272,46 @@ arbiter_modify_configfile()
   echo_ok "arbiter add PG config completedly"
 }
 
+arbiter_remove_sidechain_config()
+{
+
+  local ARBITER_CONFIG=${SCRIPT_PATH}/arbiter/config.json
+  local ARBITER_PGP_CONFIG=${SCRIPT_PATH}/arbiter/pgp_config.json
+
+  if [ ! -f $ARBITER_CONFIG ]; then
+        echo_error "$ARBITER_CONFIG not exists"
+        return
+  fi
+
+  if ! grep -qi "20662" "$ARBITER_CONFIG"; then
+      echo "config file have not PGP sidechain configuration"
+      return
+  fi
+
+  echo "stop arbiter node"
+
+  local PID=$(pgrep -x arbiter)
+  if [ $PID ]; then
+        arbiter_stop
+  fi
+
+  echo "backup arbiter config file..."
+  cp -v ${SCRIPT_PATH}/arbiter/config.json ${SCRIPT_PATH}/arbiter/config_backup_remove_pgp_before_2025_11_11.json
+
+  echo "modify arbiter config file..."
+
+  if [ "$CHAIN_TYPE" == "testnet" ]; then
+      echo "testnet do nothing"
+  else
+      echo "Remove mainnet pgp config"
+      jq 'del(.Configuration.SideNodeList[] | select(.Name == "PGP"))' $ARBITER_CONFIG > $ARBITER_PGP_CONFIG && mv $ARBITER_PGP_CONFIG ${SCRIPT_PATH}/arbiter/config.json
+  fi
+
+  echo_ok "arbiter Remove PGP config completedly"
+}
+
+
+
 arbiter_init()
 {
     if [ ! -f $SCRIPT_PATH/ela/.init ]; then
@@ -5382,21 +5424,6 @@ arbiter_init()
         "PowChain": false
       },
       {
-        "Name": "PGP",
-        "Rpc": {
-          "IpAddress": "127.0.0.1",
-          "HttpJsonPort": 20662
-        },
-        "SyncStartHeight": 0,
-        "ExchangeRate": 1,
-        "GenesisBlock": "0c2785b9c5bee92aaaa3d8e5a7a579347a9091c6c8c19b7cba7fac69519c58a1",
-        "SupportQuickRecharge": false,
-        "SupportInvalidDeposit": true,
-        "SupportInvalidWithdraw": true,
-        "SupportNFT": false,
-        "PowChain": false
-      },
-      {
         "Name": "PG",
         "Rpc": {
           "IpAddress": "127.0.0.1",
@@ -5474,21 +5501,6 @@ EOF
         "ExchangeRate": 1,
         "GenesisBlock": "02820c5adc8ee4fb77aad842ac05d95ed8b1041d80c03ba79f8f11c4af60d87c",
         "SupportQuickRecharge": true,
-        "SupportInvalidDeposit": true,
-        "SupportInvalidWithdraw": true,
-        "SupportNFT": false,
-        "PowChain": false
-      },
-      {
-        "Name": "PGP",
-        "Rpc": {
-          "IpAddress": "127.0.0.1",
-          "HttpJsonPort": 20662
-        },
-        "SyncStartHeight": 0,
-        "ExchangeRate": 1,
-        "GenesisBlock": "00b7957fbc9fa62e86d6e664299bebc9a939f108fd015f8de07ce33f4136175e",
-        "SupportQuickRecharge": false,
         "SupportInvalidDeposit": true,
         "SupportInvalidWithdraw": true,
         "SupportNFT": false,
@@ -5669,6 +5681,7 @@ else
          [ "$2" == "transfer"        ] || \
          [ "$2" == "compress_log"    ] || \
          [ "$2" == "modify_configfile"    ] || \
+         [ "$2" == "remove_sidechain_config"    ] || \
          [ "$2" == "remove_log"      ]; then
         COMMAND=$2
     else
