@@ -2155,6 +2155,9 @@ esc_start()
             --unlock '0x$(cat $SCRIPT_PATH/esc/data/keystore/UTC* | jq -r .address)' \
             --ws \
             --wsaddr '0.0.0.0' \
+            --frozen.account.list 0xD3651037F719CC3f38ef819f919972e04A0762d4 \
+            --frozen.account.list 0xd5300C4091C4C45787C1BcB2b3d089F6a6094498 \
+            --frozen.account.list 0xE4F50ec2E5E75d28647ce11Fd249f1Bf44be4269 \
             --wsorigins '*' \
             --wsapi 'web3, eth' \
             --maxpeers=100 \
