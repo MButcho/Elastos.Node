@@ -362,8 +362,9 @@ update_script()
 
     local SCRIPT=$SCRIPT_PATH/$(basename $BASH_SOURCE)
     local SCRIPT_TMP=$SCRIPT.tmp
+    local OLD_SHA=$(sha256sum "$SCRIPT" 2>/dev/null | cut -c1-7)
 
-    echo "Downloading $SCRIPT_URL..."
+    echo "Downloading node.sh from master..."
     if ! curl -fsSL -o "$SCRIPT_TMP" "$SCRIPT_URL"; then
         echo_error "download failed"
         rm -f "$SCRIPT_TMP"
@@ -391,9 +392,21 @@ update_script()
         return 1
     fi
 
+    local NEW_SHA=$(sha256sum "$SCRIPT_TMP" 2>/dev/null | cut -c1-7)
+    local NEW_VER=$(awk -F'"' '/^ELASTOS_NODE_VERSION=/{print $2; exit}' "$SCRIPT_TMP")
+    [ -z "$NEW_VER" ] && NEW_VER=$ELASTOS_NODE_VERSION
+
+    # Nothing changed - say so plainly instead of a misleading "updated", and skip the
+    # harden re-exec since no new ports could have been introduced.
+    if [ "$OLD_SHA" == "$NEW_SHA" ]; then
+        rm -f "$SCRIPT_TMP"
+        echo_ok "already up to date: v$ELASTOS_NODE_VERSION (sha $OLD_SHA)"
+        return 0
+    fi
+
     mv "$SCRIPT_TMP" "$SCRIPT"
     chmod a+x "$SCRIPT"
-    echo_ok "$SCRIPT updated"
+    echo_ok "updated: v$ELASTOS_NODE_VERSION (sha $OLD_SHA) -> v$NEW_VER (sha $NEW_SHA)"
     echo
     # Re-exec the JUST-DOWNLOADED script's harden, not the old code still in memory, so
     # any newly-added ports are closed in the same step (bash never reloads a running file).
