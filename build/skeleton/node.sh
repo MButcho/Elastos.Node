@@ -2000,9 +2000,11 @@ all_start()
 # wait_stop <pid>: after a chain has been signalled, wait for it to exit (printing
 # dots), then escalate to SIGKILL if it is still alive after the grace period - so
 # `stop` can never hang forever on a process that ignores the signal. The grace
-# window is generous on purpose: a geth side chain can take a while to flush state on
-# shutdown, and a premature SIGKILL mid-flush can corrupt chaindata.
-STOP_GRACE=180
+# window is deliberately long: a geth side chain (esc/eid/pg) or the ela main chain
+# can take a while to flush state on shutdown, and a premature SIGKILL mid-flush can
+# corrupt chaindata. 300s matches the chains' own shutdown flush budget; a healthy
+# chain exits in seconds, so the SIGKILL only ever fires on a genuinely stuck process.
+STOP_GRACE=300
 wait_stop()
 {
     local pid=$1 n=0
