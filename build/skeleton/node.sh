@@ -2005,15 +2005,19 @@ all_start()
 # corrupt chaindata. 300s matches the chains' own shutdown flush budget; a healthy
 # chain exits in seconds, so the SIGKILL only ever fires on a genuinely stuck process.
 STOP_GRACE=300
+# Stateless services (arbiter, oracles) hold no chaindata, so a SIGKILL can't corrupt
+# anything and a long wait is pointless - they get a short grace. The arbiter in
+# particular ignores SIGTERM and would otherwise burn the full chain grace on every stop.
+STOP_GRACE_SVC=20
 wait_stop()
 {
-    local pid=$1 n=0
+    local pid=$1 grace=${2:-$STOP_GRACE} n=0
     while ps -p $pid 1>/dev/null 2>&1; do
         echo -n .
         sleep 1
         n=$((n + 1))
-        if [ $n -ge $STOP_GRACE ]; then
-            echo; echo_warn "still running after ${STOP_GRACE}s - sending SIGKILL"
+        if [ $n -ge $grace ]; then
+            echo; echo_warn "still running after ${grace}s - sending SIGKILL"
             kill -9 $pid 2>/dev/null
             sleep 1
             break
@@ -5116,7 +5120,7 @@ esc-oracle_stop()
     if [ "$PID" != "" ]; then
         echo "Stopping esc-oracle..."
         kill $PID
-        wait_stop $PID
+        wait_stop $PID $STOP_GRACE_SVC
     fi
     esc-oracle_status
 }
@@ -5127,7 +5131,7 @@ eco-oracle_stop()
     if [ "$PID" != "" ]; then
         echo "Stopping eco-oracle..."
         kill $PID
-        wait_stop $PID
+        wait_stop $PID $STOP_GRACE_SVC
     fi
     eco-oracle_status
 }
@@ -5138,7 +5142,7 @@ pgp-oracle_stop()
     if [ "$PID" != "" ]; then
         echo "Stopping pgp-oracle..."
         kill $PID
-        wait_stop $PID
+        wait_stop $PID $STOP_GRACE_SVC
     fi
     pgp-oracle_status
 }
@@ -5149,7 +5153,7 @@ pg-oracle_stop()
     if [ "$PID" != "" ]; then
         echo "Stopping pg-oracle..."
         kill $PID
-        wait_stop $PID
+        wait_stop $PID $STOP_GRACE_SVC
     fi
     pg-oracle_status
 }
@@ -6071,7 +6075,7 @@ eid-oracle_stop()
     if [ "$PID" != "" ]; then
         echo "Stopping eid-oracle..."
         kill $PID
-        wait_stop $PID
+        wait_stop $PID $STOP_GRACE_SVC
     fi
     eid-oracle_status
 }
@@ -6258,7 +6262,7 @@ arbiter_stop()
     if [ "$PID" != "" ]; then
         echo "Stopping arbiter..."
         kill $PID
-        wait_stop $PID
+        wait_stop $PID $STOP_GRACE_SVC
     fi
     sync
     arbiter_status
