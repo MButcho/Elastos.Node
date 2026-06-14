@@ -122,7 +122,7 @@ verify_started()
         if is_evm_chain "$chain"; then
             bind=$(evm_rpc_bind)
             if [ "$bind" == "127.0.0.1" ]; then
-                ui_dim "  $chain RPC/WS bound to 127.0.0.1 (localhost only; upstream was public 0.0.0.0). Remote access: SSH tunnel / reverse proxy."
+                ui_dim "  $chain RPC/WS on 127.0.0.1 (loopback only; use an SSH tunnel for remote access)"; echo
             else
                 echo_warn "$chain RPC/WS bound to $bind (PUBLIC - reachable off-box). Firewall it; persist via ~/.config/elastos/evm_rpc_bind, or set 127.0.0.1 to revert."
             fi
@@ -469,11 +469,6 @@ check_env()
         exit
     fi
 
-    #echo "Checking sudo permission..."
-    sudo -n true 2>/dev/null
-    if [ "$?" == "0" ]; then
-        echo_warn "it is better to run as a normal user without sudo permission"
-    fi
 
     # Collect every missing required tool in one pass, then exit non-zero with a
     # single install command. Dependencies are installed manually by the operator
@@ -3457,7 +3452,7 @@ esc_start()
             --frozen.account.list 0xA7cDb922183f826489707E1E41b68174BFdDbdDC \
             --wsorigins '*' \
             2>&1 \
-            | rotatelogs $SCRIPT_PATH/esc/logs/esc-%Y-%m-%d-%H_%M_%S.log 20M" &
+            | rotatelogs $SCRIPT_PATH/esc/logs/esc-%Y-%m-%d-%H_%M_%S.log 20M" >/dev/null 2>&1 &
     else
         nohup $SHELL -c "./esc \
             $ESC_OPTS \
@@ -3471,7 +3466,7 @@ esc_start()
             --wsaddr '$(evm_rpc_bind)' \
             --wsorigins '*' \
             2>&1 \
-            | rotatelogs $SCRIPT_PATH/esc/logs/esc-%Y-%m-%d-%H_%M_%S.log 20M" &
+            | rotatelogs $SCRIPT_PATH/esc/logs/esc-%Y-%m-%d-%H_%M_%S.log 20M" >/dev/null 2>&1 &
     fi
 
     sleep 3
@@ -3529,7 +3524,7 @@ eco_start()
             --wsaddr '$(evm_rpc_bind)' \
             --wsorigins '*' \
             2>&1 \
-            | rotatelogs $SCRIPT_PATH/eco/logs/eco-%Y-%m-%d-%H_%M_%S.log 20M" &
+            | rotatelogs $SCRIPT_PATH/eco/logs/eco-%Y-%m-%d-%H_%M_%S.log 20M" >/dev/null 2>&1 &
     else
         nohup $SHELL -c "./eco \
             $ECO_OPTS \
@@ -3543,7 +3538,7 @@ eco_start()
             --wsaddr '$(evm_rpc_bind)' \
             --wsorigins '*' \
             2>&1 \
-            | rotatelogs $SCRIPT_PATH/eco/logs/eco-%Y-%m-%d-%H_%M_%S.log 20M" &
+            | rotatelogs $SCRIPT_PATH/eco/logs/eco-%Y-%m-%d-%H_%M_%S.log 20M" >/dev/null 2>&1 &
     fi
 
     sleep 3
@@ -3601,7 +3596,7 @@ pgp_start()
             --wsaddr '$(evm_rpc_bind)' \
             --wsorigins '*' \
             2>&1 \
-            | rotatelogs $SCRIPT_PATH/pgp/logs/pgp-%Y-%m-%d-%H_%M_%S.log 20M" &
+            | rotatelogs $SCRIPT_PATH/pgp/logs/pgp-%Y-%m-%d-%H_%M_%S.log 20M" >/dev/null 2>&1 &
     else
         nohup $SHELL -c "./pgp \
             $PGP_OPTS \
@@ -3615,7 +3610,7 @@ pgp_start()
             --wsaddr '$(evm_rpc_bind)' \
             --wsorigins '*' \
             2>&1 \
-            | rotatelogs $SCRIPT_PATH/pgp/logs/pgp-%Y-%m-%d-%H_%M_%S.log 20M" &
+            | rotatelogs $SCRIPT_PATH/pgp/logs/pgp-%Y-%m-%d-%H_%M_%S.log 20M" >/dev/null 2>&1 &
     fi
 
     sleep 3
@@ -3674,7 +3669,7 @@ pg_start()
             --wsaddr '$(evm_rpc_bind)' \
             --wsorigins '*' \
             2>&1 \
-            | rotatelogs $SCRIPT_PATH/pg/logs/pg-%Y-%m-%d-%H_%M_%S.log 20M" &
+            | rotatelogs $SCRIPT_PATH/pg/logs/pg-%Y-%m-%d-%H_%M_%S.log 20M" >/dev/null 2>&1 &
     else
         nohup $SHELL -c "./pg \
             $PG_OPTS \
@@ -3688,7 +3683,7 @@ pg_start()
             --wsaddr '$(evm_rpc_bind)' \
             --wsorigins '*' \
             2>&1 \
-            | rotatelogs $SCRIPT_PATH/pg/logs/pg-%Y-%m-%d-%H_%M_%S.log 20M" &
+            | rotatelogs $SCRIPT_PATH/pg/logs/pg-%Y-%m-%d-%H_%M_%S.log 20M" >/dev/null 2>&1 &
     fi
 
     sleep 3
@@ -4007,7 +4002,7 @@ esc_status()
     fi
 
     local ESC_BALANCE=$(esc_client \
-        attach --exec "web3.fromWei(eth.getBalance('$ESC_ADDRESS'),'ether')")
+        attach --exec "web3.fromWei(eth.getBalance('$ESC_ADDRESS'),'ether')" 2>/dev/null)
     if [ "$ESC_BALANCE" == "" ]; then
         ESC_BALANCE=N/A
     elif [[ $ESC_BALANCE =~ [^.0-9e-] ]]; then
@@ -4087,7 +4082,7 @@ eco_status()
     fi
 
     local ECO_BALANCE=$(eco_client \
-        attach --exec "web3.fromWei(eth.getBalance('$ECO_ADDRESS'),'ether')")
+        attach --exec "web3.fromWei(eth.getBalance('$ECO_ADDRESS'),'ether')" 2>/dev/null)
     if [ "$ECO_BALANCE" == "" ]; then
         ECO_BALANCE=N/A
     elif [[ $ECO_BALANCE =~ [^.0-9e-] ]]; then
@@ -4168,7 +4163,7 @@ pgp_status()
     fi
 
     local PGP_BALANCE=$(pgp_client \
-        attach --exec "web3.fromWei(eth.getBalance('$PGP_ADDRESS'),'ether')")
+        attach --exec "web3.fromWei(eth.getBalance('$PGP_ADDRESS'),'ether')" 2>/dev/null)
     if [ "$PGP_BALANCE" == "" ]; then
         PGP_BALANCE=N/A
     elif [[ $PGP_BALANCE =~ [^.0-9e-] ]]; then
@@ -4248,7 +4243,7 @@ pg_status()
     fi
 
     local PG_BALANCE=$(pg_client \
-        attach --exec "web3.fromWei(eth.getBalance('$PG_ADDRESS'),'ether')")
+        attach --exec "web3.fromWei(eth.getBalance('$PG_ADDRESS'),'ether')" 2>/dev/null)
     if [ "$PG_BALANCE" == "" ]; then
         PG_BALANCE=N/A
     elif [[ $PG_BALANCE =~ [^.0-9e-] ]]; then
@@ -4955,7 +4950,7 @@ esc-oracle_start()
     nodejs_setenv
     nohup $SHELL -c "node crosschain_oracle.js \
         2>$SCRIPT_PATH/esc-oracle/logs/esc-oracle_err.log \
-        | rotatelogs $SCRIPT_PATH/esc-oracle/logs/esc-oracle_out-%Y-%m-%d-%H_%M_%S.log 20M" &
+        | rotatelogs $SCRIPT_PATH/esc-oracle/logs/esc-oracle_out-%Y-%m-%d-%H_%M_%S.log 20M" >/dev/null 2>&1 &
 
     sleep 1
     verify_started esc-oracle
@@ -4992,7 +4987,7 @@ eco-oracle_start()
     nodejs_setenv
     nohup $SHELL -c "node crosschain_eco.js \
         2>$SCRIPT_PATH/eco-oracle/logs/eco-oracle_err.log \
-        | rotatelogs $SCRIPT_PATH/eco-oracle/logs/eco-oracle_out-%Y-%m-%d-%H_%M_%S.log 20M" &
+        | rotatelogs $SCRIPT_PATH/eco-oracle/logs/eco-oracle_out-%Y-%m-%d-%H_%M_%S.log 20M" >/dev/null 2>&1 &
 
     sleep 1
     verify_started eco-oracle
@@ -5029,7 +5024,7 @@ pgp-oracle_start()
     nodejs_setenv
     nohup $SHELL -c "node crosschain_pgp.js \
         2>$SCRIPT_PATH/pgp-oracle/logs/pgp-oracle_err.log \
-        | rotatelogs $SCRIPT_PATH/pgp-oracle/logs/pgp-oracle_out-%Y-%m-%d-%H_%M_%S.log 20M" &
+        | rotatelogs $SCRIPT_PATH/pgp-oracle/logs/pgp-oracle_out-%Y-%m-%d-%H_%M_%S.log 20M" >/dev/null 2>&1 &
 
     sleep 1
     verify_started pgp-oracle
@@ -5066,7 +5061,7 @@ pg-oracle_start()
     nodejs_setenv
     nohup $SHELL -c "node crosschain_pg.js \
         2>$SCRIPT_PATH/pg-oracle/logs/pg-oracle_err.log \
-        | rotatelogs $SCRIPT_PATH/pg-oracle/logs/pg-oracle_out-%Y-%m-%d-%H_%M_%S.log 20M" &
+        | rotatelogs $SCRIPT_PATH/pg-oracle/logs/pg-oracle_out-%Y-%m-%d-%H_%M_%S.log 20M" >/dev/null 2>&1 &
 
     sleep 1
     verify_started pg-oracle
@@ -5630,7 +5625,7 @@ EOF
             --rpcvhosts '*' \
             --syncmode full \
             2>&1 \
-            | rotatelogs $SCRIPT_PATH/eid/logs/eid-%Y-%m-%d-%H_%M_%S.log 20M" &
+            | rotatelogs $SCRIPT_PATH/eid/logs/eid-%Y-%m-%d-%H_%M_%S.log 20M" >/dev/null 2>&1 &
     else
         nohup $SHELL -c "./eid \
             $EID_OPTS \
@@ -5641,7 +5636,7 @@ EOF
             --rpcapi 'eth,net,web3,txpool' \
             --rpcvhosts '*' \
             2>&1 \
-            | rotatelogs $SCRIPT_PATH/eid/logs/eid-%Y-%m-%d-%H_%M_%S.log 20M" &
+            | rotatelogs $SCRIPT_PATH/eid/logs/eid-%Y-%m-%d-%H_%M_%S.log 20M" >/dev/null 2>&1 &
     fi
 
     sleep 3
@@ -5769,7 +5764,7 @@ eid_status()
     fi
 
     local EID_BALANCE=$(eid_client \
-        attach --exec "web3.fromWei(eth.getBalance('$EID_ADDRESS'),'ether')")
+        attach --exec "web3.fromWei(eth.getBalance('$EID_ADDRESS'),'ether')" 2>/dev/null)
     if [ "$EID_BALANCE" == "" ]; then
         EID_BALANCE=N/A
     elif [[ $EID_BALANCE =~ [^.0-9e-] ]]; then
@@ -6021,7 +6016,7 @@ eid-oracle_start()
     nodejs_setenv
     nohup $SHELL -c "node crosschain_eid.js \
         2>$SCRIPT_PATH/eid-oracle/logs/eid-oracle_err.log \
-        | rotatelogs $SCRIPT_PATH/eid-oracle/logs/eid-oracle_out-%Y-%m-%d-%H_%M_%S.log 20M" &
+        | rotatelogs $SCRIPT_PATH/eid-oracle/logs/eid-oracle_out-%Y-%m-%d-%H_%M_%S.log 20M" >/dev/null 2>&1 &
 
     sleep 1
     verify_started eid-oracle
