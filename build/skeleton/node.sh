@@ -1472,7 +1472,19 @@ monitor_enable()
     echo "  IP reported: $ip"
     monitor_report
     echo
-    echo "  reporting every minute - your node will appear on the monitor shortly."
+    # The monitor keeps NO record until this node's key is on the on-chain
+    # BPoS/council list (register returns tracked:false until then); the timer
+    # keeps reporting so it enrolls automatically the moment the key appears.
+    # NB: use an explicit if/else, not `.tracked // empty` - jq's `//` treats a
+    # literal `false` as empty, so `.tracked // empty` would print "" for
+    # {"tracked":false} and this branch would never fire.
+    local tracked=$(printf '%s' "$resp" | jq -r 'if .tracked==false then "false" else "" end' 2>/dev/null)
+    if [ "$tracked" = "false" ]; then
+        echo "  not on the BPoS/council list yet - reporting every minute; once your key is"
+        echo "  on-chain (after you claim) the node enrolls automatically and appears on the monitor."
+    else
+        echo "  reporting every minute - your node will appear on the monitor shortly."
+    fi
 }
 
 # monitor_report: collect this node's status and push it once. Run by cron; also
@@ -1502,20 +1514,30 @@ monitor_report()
           dposPublicKey:(if $pub=="" then null else $pub end),
           publicIp:$ip, capturedAt:$ts, seq:$seq, chains:$chains}')
 
-    local code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
+    # Capture the body too (not just the code) so we can tell a node that is
+    # merely "not on-chain yet" (reason=not_on_chain, will enroll on claim) from
+    # one an admin actually disabled.
+    local raw=$(curl -s -w '\n%{http_code}' --max-time 15 \
         -X POST "$url/api/status" \
         -H 'Content-Type: application/json' \
         -H "Authorization: Bearer $token" -d "$envelope" 2>/dev/null)
+    local code=${raw##*$'\n'}
+    local rbody=${raw%$'\n'*}
+    local reason=$(printf '%s' "$rbody" | jq -r '.reason // empty' 2>/dev/null)
 
-    jq --argjson seq "$seq" --argjson ts "$now" --arg code "$code" \
-        '.seq=$seq | .lastReportAt=$ts | .lastCode=$code' "$MONITOR_CONFIG" \
+    jq --argjson seq "$seq" --argjson ts "$now" --arg code "$code" --arg reason "$reason" \
+        '.seq=$seq | .lastReportAt=$ts | .lastCode=$code | .lastReason=$reason' "$MONITOR_CONFIG" \
         > "$MONITOR_CONFIG.tmp" 2>/dev/null \
         && mv "$MONITOR_CONFIG.tmp" "$MONITOR_CONFIG" && chmod 600 "$MONITOR_CONFIG"
 
     if ! noninteractive; then
         case "$code" in
             2*)  echo_ok "report sent (accepted)" ;;
-            403) echo_warn "report sent - this node is not active (disabled on the monitor?)" ;;
+            403) if [ "$reason" = "not_on_chain" ]; then
+                     echo_warn "report sent - not on the BPoS/council list yet; enrolls automatically once your key is on-chain"
+                 else
+                     echo_warn "report sent - this node is not active (disabled on the monitor?)"
+                 fi ;;
             000|"") echo_error "could not reach $url" ;;
             *)   echo_warn "report sent - monitor returned HTTP $code" ;;
         esac
@@ -1533,6 +1555,7 @@ monitor_status()
     local url=$(jq -r '.url' "$MONITOR_CONFIG")
     local last=$(jq -r '.lastReportAt // empty' "$MONITOR_CONFIG")
     local code=$(jq -r '.lastCode // empty' "$MONITOR_CONFIG")
+    local reason=$(jq -r '.lastReason // empty' "$MONITOR_CONFIG")
     echo "Monitoring: on"
     echo "  monitor: $url"
     if [ -n "$last" ]; then
@@ -1543,7 +1566,11 @@ monitor_status()
     fi
     case "$code" in
         2*)  echo "  state: active - reports accepted" ;;
-        403) echo "  state: not active - this node was disabled on the monitor" ;;
+        403) if [ "$reason" = "not_on_chain" ]; then
+                 echo "  state: waiting - not on the BPoS/council list yet (enrolls once your key is on-chain)"
+             else
+                 echo "  state: not active - this node was disabled on the monitor"
+             fi ;;
         "")  ;;
         *)   echo "  state: error (HTTP $code) - check the monitor URL" ;;
     esac
