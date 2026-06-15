@@ -17,6 +17,11 @@ All notable changes to this project are documented in this file. Releases are ta
 - `install.sh` fails closed if the published checksum cannot be fetched.
 - The arbiter startup message no longer references the decommissioned `eco-oracle`.
 - `node.sh` uses `sha256sum` (always present on Ubuntu) instead of `shasum`.
+- **EVM init verifies the keystore password before completing.** A resumed `esc`/`eid`/`pg` init that adopts an existing keystore now confirms the saved password unlocks it before stamping `.init`, matching `ela` init. A mismatched password file (for example after restoring a keystore from a backup) is reported as an error instead of leaving a side chain that runs but cannot sign.
+- **`firewall` will not auto-enable on an unverified SSH port.** Detection also reads `/etc/ssh/sshd_config` and its drop-ins and runs `sshd -T` under `sudo`; when no SSH port can be confirmed (for example under `su` or a detached `tmux` with no `$SSH_CONNECTION`), it declines to enable `ufw` and prints the commands to run by hand rather than assuming port 22 and risking a lockout.
+- **`check_env`** also requires `curl` and `openssl` (both used during init), recognizes Ubuntu from `/etc/os-release` when `lsb_release` is absent, and exits non-zero on an unsupported OS or architecture (it previously exited 0).
+- **`update_script`** aborts with an error if it cannot replace the on-disk script (for example an immutable file) instead of reporting success while still running the old version, and no longer suppresses the `harden` step's firewall warnings.
+- **`init`** regenerates placeholder RPC credentials left by an interrupted `ela` init, so the main chain never starts with the default `User`/`Pass`.
 
 ## v1.1.0 - First stable release
 
