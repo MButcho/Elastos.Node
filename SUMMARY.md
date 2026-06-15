@@ -11,6 +11,7 @@
 * [BPoS Setup](docs/bpos-setup.md)
 * [node.sh](docs/what-is-node.sh.md)
 * [Quick Setup](docs/quick-setup.md)
+* [Command Reference](docs/commands.md)
 * [Step-by-Step Setup](docs/archives/step-by-step-setup.md)
   * [Checking Environments](docs/archives/step-by-step-setup/checking-environments.md)
   * [Installing node.sh](docs/archives/step-by-step-setup/installing-node.sh.md)
