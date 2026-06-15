@@ -230,9 +230,8 @@ chain_pid()
     esac
 }
 
-# render_status_one <chain>: the chain's own status block, with the noise fields
-# (Balance / PID / #Files / #TCP / port lists) removed. Labeled + aligned, like the
-# classic view the operator preferred - just without the clutter.
+# render_status_one <chain>: print the chain's full labeled status block (the classic
+# upstream view the operator preferred). Routed to by the default '<chain> status'.
 render_status_one()
 {
     # the familiar upstream labeled block, verbatim - one aligned field per line
@@ -394,7 +393,10 @@ update_script()
 
     local NEW_SHA=$(sha256sum "$SCRIPT_TMP" 2>/dev/null | cut -c1-7)
     local NEW_VER=$(awk -F'"' '/^ELASTOS_NODE_VERSION=/{print $2; exit}' "$SCRIPT_TMP")
-    [ -z "$NEW_VER" ] && NEW_VER=$ELASTOS_NODE_VERSION
+    if [ -z "$NEW_VER" ]; then
+        NEW_VER=$ELASTOS_NODE_VERSION
+        echo_warn "could not read the new version string - reporting the change by checksum only"
+    fi
 
     # Nothing changed - say so plainly instead of a misleading "updated", and skip the
     # harden re-exec since no new ports could have been introduced.
@@ -404,13 +406,18 @@ update_script()
         return 0
     fi
 
-    mv "$SCRIPT_TMP" "$SCRIPT"
+    if ! mv "$SCRIPT_TMP" "$SCRIPT"; then
+        echo_error "could not replace $SCRIPT (immutable bit or read-only path?) - still running the old version"
+        rm -f "$SCRIPT_TMP"
+        return 1
+    fi
     chmod a+x "$SCRIPT"
     echo_ok "updated: v$ELASTOS_NODE_VERSION (sha $OLD_SHA) -> v$NEW_VER (sha $NEW_SHA)"
     echo
     # Re-exec the JUST-DOWNLOADED script's harden, not the old code still in memory, so
     # any newly-added ports are closed in the same step (bash never reloads a running file).
-    "$SCRIPT" harden 2>/dev/null || harden_firewall
+    # No 2>/dev/null here: harden's ufw-inactive/not-installed warnings must reach the operator.
+    "$SCRIPT" harden || harden_firewall
 }
 # has_cold_miner <chain>: true when the chain either does not mine or has a valid
 # cold reward address set. Silent; used by warn_hot_miner and status displays.
@@ -452,14 +459,19 @@ check_env()
     if [ "$(uname -s)" == "Linux" ]; then
         local DIST_NAME=$(lsb_release -s -i 2>/dev/null)
         local DIST_VER=$(lsb_release -s -r 2>/dev/null)
+        # Minimal images ship no lsb_release; fall back to /etc/os-release (NAME=Ubuntu).
+        if [ -z "$DIST_NAME" ] && [ -r /etc/os-release ]; then
+            DIST_NAME=$(. /etc/os-release 2>/dev/null && echo "$NAME" | cut -d' ' -f1)
+            DIST_VER=$(. /etc/os-release 2>/dev/null && echo "$VERSION_ID")
+        fi
         if [ "$DIST_NAME" == "Ubuntu" ]; then
-            if [ "$DIST_VER" \< "18.04" ]; then
+            if [ -n "$DIST_VER" ] && [ "$DIST_VER" \< "18.04" ]; then
                 echo_error "this script requires Ubuntu 18.04 or higher"
-                exit
+                exit 1
             fi
         else
             echo_error "do not support $(cat /etc/issue)"
-            exit
+            exit 1
         fi
         if [ "$(uname -m)" == "aarch64" ]; then
             # The ARM64 version has not been fully tested.
@@ -468,7 +480,7 @@ check_env()
             local ENABLE_ARM64=
             if [ "$ENABLE_ARM64" == "" ]; then
                 echo_error "do not support $(uname -m)"
-                exit
+                exit 1
             else
                 echo_warn "the arm64 build have not been fully-tested"
             fi
@@ -476,10 +488,11 @@ check_env()
             true
         else
             echo_error "do not support $(uname -m)"
+            exit 1
         fi
     else
         echo_error "do not support $(uname -s)"
-        exit
+        exit 1
     fi
 
 
@@ -499,6 +512,14 @@ check_env()
     if [ "$(which rotatelogs)" == "" ]; then
         MISSING_TOOLS="$MISSING_TOOLS rotatelogs"
         MISSING_PKGS="$MISSING_PKGS apache2-utils"
+    fi
+    if [ "$(which curl)" == "" ]; then
+        MISSING_TOOLS="$MISSING_TOOLS curl"
+        MISSING_PKGS="$MISSING_PKGS curl"
+    fi
+    if [ "$(which openssl)" == "" ]; then
+        MISSING_TOOLS="$MISSING_TOOLS openssl"
+        MISSING_PKGS="$MISSING_PKGS openssl"
     fi
     if [ -n "$MISSING_TOOLS" ]; then
         echo_error "missing required tool(s):$MISSING_TOOLS"
@@ -1192,12 +1213,21 @@ firewall()
     local prof p port ssh_ports= ANSWER
     prof=$(get_profile)
 
-    # Detect the real SSH port(s) so enabling ufw can never lock out this session:
-    #   - sshd -T lists every 'Port' the daemon listens on (may be several, may be non-22)
-    #   - $SSH_CONNECTION's 4th field is the local port THIS session arrived on
-    # Fall back to 22 only when nothing is detected.
-    for port in $(sshd -T 2>/dev/null | awk '/^port /{print $2}') $(echo "$SSH_CONNECTION" | awk '{print $4}'); do
-        case " $ssh_ports " in *" $port "*) ;; *) [ -n "$port" ] && ssh_ports="$ssh_ports $port" ;; esac
+    # Detect the real SSH port(s) so enabling ufw can never lock out this session. We gather
+    # from every reliable source; only when NOTHING is found do we fall back to 22 - and in
+    # that case we refuse to auto-enable, because a wrong guess locks an operator out of a
+    # headless box (provider rescue console required to recover):
+    #   - $SSH_CONNECTION's 4th field: the local port THIS session arrived on (always set in a
+    #     login shell; absent under su / a reattached tmux / an env-scrubbed sudo)
+    #   - sshd -T: the daemon's effective config (needs root to read host keys; try via sudo -n)
+    #   - sshd_config + its drop-ins: explicit 'Port' directives, readable without root
+    local ssh_detected= ssh_cfgs=/etc/ssh/sshd_config
+    compgen -G "/etc/ssh/sshd_config.d/*.conf" >/dev/null 2>&1 && ssh_cfgs="$ssh_cfgs /etc/ssh/sshd_config.d/*.conf"
+    for p in $(echo "$SSH_CONNECTION" | awk '{print $4}') \
+             $(sudo -n sshd -T 2>/dev/null | awk '/^port /{print $2}') \
+             $(awk '/^[Pp]ort /{print $2}' $ssh_cfgs 2>/dev/null); do
+        [ -n "$p" ] || continue
+        case " $ssh_ports " in *" $p "*) ;; *) ssh_ports="$ssh_ports $p"; ssh_detected=1 ;; esac
     done
     ssh_ports=$(echo $ssh_ports)
     [ -z "$ssh_ports" ] && ssh_ports=22
@@ -1221,11 +1251,21 @@ firewall()
     fi
 
     echo "Firewall plan for profile '$prof' (RPC stays on 127.0.0.1):"
-    echo "  detected SSH port(s): $ssh_ports"
+    if [ -n "$ssh_detected" ]; then
+        echo "  detected SSH port(s): $ssh_ports"
+    else
+        echo "  SSH port(s): could not detect - assuming 22 (UNVERIFIED)"
+    fi
     echo
     echo -e "$cmds" | sed 's/^/  /'
     echo "  sudo ufw --force enable"
     echo
+    if [ -z "$ssh_detected" ]; then
+        echo_warn "could not confirm this session's SSH port - run 'node.sh firewall' directly over SSH (not via su/tmux/sudo) so it can auto-detect the port"
+        echo_warn "refusing to auto-enable: enabling ufw on an unverified SSH port can lock you out of a headless host"
+        echo "Review the commands above, set your real SSH port, and run them by hand when ready."
+        return 0
+    fi
     echo_warn "this enables the host firewall; only the ports above stay reachable"
     read -p "Apply these rules and enable the firewall? (Yes/No) " ANSWER || { ANSWER=No; echo_warn "no input - not enabling the firewall"; }
     case "$ANSWER" in
@@ -1634,8 +1674,6 @@ monitor_cmd()
 }
 
 
-# setup: one-time host prep for a fresh Ubuntu box, then initialize the node.
-# Installs dependencies, adds swap, opens the firewall, enables autostart, runs init.
 # keystore_present <chain>: 0 if a real keystore exists for the chain, 1 otherwise.
 # ela keeps a single keystore.dat; esc/eid/pg keep an EVM account file under data/keystore.
 keystore_present()
@@ -2631,6 +2669,24 @@ EOF
             $ELA_CONFIG >$ELA_CONFIG.tmp
         if [ "$?" == "0" ]; then
             mv $ELA_CONFIG.tmp $ELA_CONFIG
+        fi
+    fi
+
+    # A config that survived an interrupted init may still carry the placeholder RPC
+    # credentials (interruption between writing the config and the jq credential update,
+    # or a failed jq). Regenerate them so the node never runs with User/Pass = USER/PASSWORD.
+    # Placeholders are non-functional defaults, so this is always safe.
+    if [ -f $ELA_CONFIG ] && jq -e '.Configuration.RpcConfiguration.User=="USER" or .Configuration.RpcConfiguration.Pass=="PASSWORD"' $ELA_CONFIG >/dev/null 2>&1; then
+        echo_warn "ela config has placeholder RPC credentials (interrupted init) - regenerating them"
+        local ELA_RPC_USER=$(openssl rand -base64 100 | sha256sum | head -c 32)
+        local ELA_RPC_PASS=$(openssl rand -base64 100 | sha256sum | head -c 32)
+        if jq ".Configuration.RpcConfiguration.User=\"$ELA_RPC_USER\" | \
+              .Configuration.RpcConfiguration.Pass=\"$ELA_RPC_PASS\"" \
+              $ELA_CONFIG >$ELA_CONFIG.tmp && [ -s $ELA_CONFIG.tmp ]; then
+            mv $ELA_CONFIG.tmp $ELA_CONFIG
+        else
+            rm -f $ELA_CONFIG.tmp
+            echo_error "failed to regenerate ela RPC credentials - config still has placeholder USER/PASSWORD"
         fi
     fi
 
@@ -4571,6 +4627,44 @@ pg_update()
 }
 
 
+# evm_verify_keystore_pass <binary> <datadir> <passfile>: best-effort check that the saved
+# password unlocks the adopted keystore. Returns:
+#   0  verified - the password decrypts the keystore
+#   1  WRONG    - geth reported it could not decrypt the key with this password
+#   2  UNKNOWN  - could not run the check (no keystore/address, mktemp/cp failed, or geth failed
+#                 without a decrypt error); the caller warns and continues - it never blocks
+# ela_init verifies its keystore before stamping .init; the EVM chains do the same so a resumed
+# init never stamps .init on a keystore the saved password no longer opens (a silently
+# non-signing node). geth has no read-only "verify password", so we run `account update` -
+# which must DECRYPT the key to proceed - against a THROWAWAY COPY of the keystore (the real
+# keystore is never modified). account update prompts for unlock + new + confirm; we over-feed
+# the same password so a differing prompt count can never starve stdin, and we judge a failure
+# by geth's own "could not decrypt" message rather than the exit code alone - so only a
+# genuinely wrong password blocks init, while a tooling hiccup degrades to a warning.
+evm_verify_keystore_pass()
+{
+    local bin=$1 datadir=$2 passfile=$3 addr pass tmp rc
+    pass=$(cat "$passfile" 2>/dev/null)
+    [ -n "$pass" ] || return 2
+    addr=$("$bin" --datadir "$datadir" --nousb --verbosity 0 account list 2>/dev/null \
+        | head -1 | sed 's/.*{\(.*\)}.*/\1/')
+    [ -n "$addr" ] || return 2
+    tmp=$(mktemp -d) || return 2
+    mkdir -p "$tmp/keystore"
+    cp "$datadir"/keystore/* "$tmp/keystore/" 2>/dev/null || { rm -rf "$tmp"; return 2; }
+    yes "$pass" | head -n 8 \
+        | "$bin" --datadir "$tmp" --nousb --verbosity 0 account update "$addr" >"$tmp/out" 2>&1
+    rc=${PIPESTATUS[2]}
+    if [ "$rc" == "0" ]; then
+        rm -rf "$tmp"; return 0
+    fi
+    if grep -qiE 'could not decrypt|wrong (pass|password)|invalid pass' "$tmp/out"; then
+        rm -rf "$tmp"; return 1
+    fi
+    rm -rf "$tmp"; return 2
+}
+
+
 esc_init()
 {
     if [ $(mem_free) -lt 512 ]; then
@@ -4638,6 +4732,18 @@ esc_init()
     local ESC_KEYSTORE=$(./esc --datadir "$SCRIPT_PATH/esc/data/" \
         --nousb --verbosity 0 account list | sed 's/.*keystore:\/\///')
     chmod 600 $ESC_KEYSTORE
+
+    if [ -n "$ESC_ADOPT" ]; then
+        echo "Verifying esc keystore password..."
+        evm_verify_keystore_pass "$SCRIPT_PATH/esc/esc" "$SCRIPT_PATH/esc/data" "$ESC_KEYSTORE_PASS_FILE"
+        case $? in
+            0) echo_ok "esc keystore password verified" ;;
+            1) echo_error "the esc password file does not unlock the existing keystore"
+               echo_error "restore the matching password file, or back up + remove esc/data/keystore and re-run init - NOT stamping .init"
+               return ;;
+            *) echo_warn "could not verify the esc keystore password (best-effort check) - continuing; esc reports any real unlock failure at start" ;;
+        esac
+    fi
 
     local ESC_MINER_ADDRESS_FILE=$SCRIPT_PATH/esc/data/miner_address.txt
     echo "You can input an alternative esc reward address. (ENTER to skip)"
@@ -4884,6 +4990,18 @@ pg_init()
     local PG_KEYSTORE=$(./pg --datadir "$SCRIPT_PATH/pg/data/" \
         --nousb --verbosity 0 account list | sed 's/.*keystore:\/\///')
     chmod 600 $PG_KEYSTORE
+
+    if [ -n "$PG_ADOPT" ]; then
+        echo "Verifying pg keystore password..."
+        evm_verify_keystore_pass "$SCRIPT_PATH/pg/pg" "$SCRIPT_PATH/pg/data" "$PG_KEYSTORE_PASS_FILE"
+        case $? in
+            0) echo_ok "pg keystore password verified" ;;
+            1) echo_error "the pg password file does not unlock the existing keystore"
+               echo_error "restore the matching password file, or back up + remove pg/data/keystore and re-run init - NOT stamping .init"
+               return ;;
+            *) echo_warn "could not verify the pg keystore password (best-effort check) - continuing; pg reports any real unlock failure at start" ;;
+        esac
+    fi
 
     local PG_MINER_ADDRESS_FILE=$SCRIPT_PATH/pg/data/miner_address.txt
     echo "You can input an alternative pg reward address. (ENTER to skip)"
@@ -5950,6 +6068,18 @@ eid_init()
     local EID_KEYSTORE=$(./eid --datadir "$SCRIPT_PATH/eid/data/" \
         --nousb --verbosity 0 account list | sed 's/.*keystore:\/\///')
     chmod 600 $EID_KEYSTORE
+
+    if [ -n "$EID_ADOPT" ]; then
+        echo "Verifying eid keystore password..."
+        evm_verify_keystore_pass "$SCRIPT_PATH/eid/eid" "$SCRIPT_PATH/eid/data" "$EID_KEYSTORE_PASS_FILE"
+        case $? in
+            0) echo_ok "eid keystore password verified" ;;
+            1) echo_error "the eid password file does not unlock the existing keystore"
+               echo_error "restore the matching password file, or back up + remove eid/data/keystore and re-run init - NOT stamping .init"
+               return ;;
+            *) echo_warn "could not verify the eid keystore password (best-effort check) - continuing; eid reports any real unlock failure at start" ;;
+        esac
+    fi
 
     local EID_MINER_ADDRESS_FILE=$SCRIPT_PATH/eid/data/miner_address.txt
     echo "You can input an alternative eid reward address. (ENTER to skip)"
