@@ -1,5 +1,11 @@
 #!/bin/bash
 
+# Elastos Node for Ubuntu - node management for the Elastos main chain, side chains, oracles, and arbiter
+ELASTOS_NODE_VERSION="1.1.0"
+
+# Reset override flags so a value inherited from the environment cannot silently enable them.
+FORCE_ELA=
+
 #
 # utility
 #
@@ -39,25 +45,404 @@ echo_ok()
     fi
 }
 
+#
+# UI: color + status glyphs, honoring NO_COLOR, --no-color, and non-TTY output.
+#
+UI_DOT_OK=$'\xe2\x97\x8f'      # filled circle  (running / healthy)
+UI_DOT_OFF=$'\xe2\x97\x8b'     # empty circle   (stopped)
+UI_DOT_WARN=$'\xe2\x97\x90'    # half circle    (attention)
+
+ui_use_color()
+{
+    [ -n "$NO_COLOR" ]    && return 1
+    [ -n "$UI_NO_COLOR" ] && return 1
+    [ -t 1 ]              || return 1
+    return 0
+}
+ui_c()  { if ui_use_color; then printf '\033[%sm%s\033[0m' "$1" "$2"; else printf '%s' "$2"; fi; }
+ui_green()  { ui_c '1;32' "$1"; }
+ui_yellow() { ui_c '1;33' "$1"; }
+ui_red()    { ui_c '1;31' "$1"; }
+ui_dim()    { ui_c '2'    "$1"; }
+ui_bold()   { ui_c '1'    "$1"; }
+
+# chain_running <chain>: true if the chain's process is alive (no RPC, cannot hang).
+chain_running()
+{
+    case "$1" in
+        ela)        pgrep -x ela     >/dev/null 2>&1 ;;
+        arbiter)    pgrep -x arbiter >/dev/null 2>&1 ;;
+        esc|eco|pgp|pg|eid)
+                    pgrep -f "^\./$1 .*--rpc " >/dev/null 2>&1 ;;
+        esc-oracle) pgrep -fx 'node crosschain_oracle.js' >/dev/null 2>&1 ;;
+        eid-oracle) pgrep -fx 'node crosschain_eid.js'    >/dev/null 2>&1 ;;
+        eco-oracle) pgrep -fx 'node crosschain_eco.js'    >/dev/null 2>&1 ;;
+        pgp-oracle) pgrep -fx 'node crosschain_pgp.js'    >/dev/null 2>&1 ;;
+        pg-oracle)  pgrep -fx 'node crosschain_pg.js'     >/dev/null 2>&1 ;;
+        *)          return 1 ;;
+    esac
+}
+
+# EVM_CHAINS: the geth-based side chains (single source of truth).
+EVM_CHAINS="esc eco pgp pg eid"
+
+# is_evm_chain <chain>: true if <chain> is one of the EVM side chains.
+is_evm_chain() { case " $EVM_CHAINS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+
+# evm_rpc_bind: the address EVM chains bind RPC/WS to. Defaults to 127.0.0.1 (localhost
+# only). Override with the EVM_RPC_BIND env var (this session) or a persistent
+# ~/.config/elastos/evm_rpc_bind file. An invalid value falls back to 127.0.0.1
+# (fail-closed - a typo must never bind somewhere unintended).
+evm_rpc_bind()
+{
+    local b=$EVM_RPC_BIND
+    [ -z "$b" ] && [ -r ~/.config/elastos/evm_rpc_bind ] && b=$(tr -d '[:space:]' < ~/.config/elastos/evm_rpc_bind 2>/dev/null)
+    [ -z "$b" ] && b=127.0.0.1
+    echo "$b" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || b=127.0.0.1
+    echo "$b"
+}
+
+# did_you_mean <input> <valid words...>: print a suggestion for a near miss.
+did_you_mean()
+{
+    local input=$1; shift
+    local best= cand
+    for cand in $*; do case "$cand" in "$input"*) best=$cand; break ;; esac; done
+    [ -z "$best" ] && for cand in $*; do case "$cand" in *"$input"*) best=$cand; break ;; esac; done
+    [ -n "$best" ] && echo "  Did you mean '$best'?"
+}
+
+# verify_started <chain>: confirm the daemon is alive shortly after a start; if not,
+# surface the failure + the tail of its most recent log, so a dead-on-launch daemon is
+# reported immediately instead of inferred from a later "stopped" status.
+verify_started()
+{
+    local chain=$1 log bind
+    if chain_running "$chain"; then
+        if is_evm_chain "$chain"; then
+            bind=$(evm_rpc_bind)
+            if [ "$bind" == "127.0.0.1" ]; then
+                ui_dim "  $chain RPC/WS on 127.0.0.1 (loopback only; use an SSH tunnel for remote access)"; echo
+            else
+                echo_warn "$chain RPC/WS bound to $bind (PUBLIC - reachable off-box). Firewall it; persist via ~/.config/elastos/evm_rpc_bind, or set 127.0.0.1 to revert."
+            fi
+        fi
+        return 0
+    fi
+    echo_error "$chain failed to start (not running after launch)"
+    log=$(ls -t "$SCRIPT_PATH/$chain/logs/"*.log "$SCRIPT_PATH/$chain/elastos/logs/node/"*.log 2>/dev/null | head -1)
+    if [ -n "$log" ]; then
+        echo "  last lines of $(basename "$log"):"
+        tail -n 6 "$log" 2>/dev/null | sed 's/^/    /'
+    fi
+    return 1
+}
+
+# --- health data substrate (timeout-bounded; never hangs; error != 0) ---
+
+evm_port() { case "$1" in esc) echo 20636;; eco) echo 20656;; pgp) echo 20666;; pg) echo 20676;; eid) echo 20646;; *) return 1;; esac; }
+
+# evm_rpc <chain> <method> [params-json] : raw JSON response (curl capped at 3s)
+evm_rpc()
+{
+    local port; port=$(evm_port "$1") || return 1
+    curl -s --max-time 3 -X POST -H 'Content-Type: application/json' \
+        --data "{\"jsonrpc\":\"2.0\",\"method\":\"$2\",\"params\":${3:-[]},\"id\":1}" \
+        "http://127.0.0.1:$port" 2>/dev/null
+}
+
+# hex_to_dec <0x..> : decimal, or empty. Avoids the $(( )) octal/zero trap.
+hex_to_dec() { case "$1" in 0x*|0X*) echo $((16#${1#0[xX]})) ;; *) return 1 ;; esac; }
+
+evm_height() { local r; r=$(evm_rpc "$1" eth_blockNumber | jq -r '.result // empty' 2>/dev/null); hex_to_dec "$r"; }
+evm_peers()  { local r; r=$(evm_rpc "$1" net_peerCount  | jq -r '.result // empty' 2>/dev/null); hex_to_dec "$r"; }
+evm_syncing()
+{
+    local r; r=$(evm_rpc "$1" eth_syncing | jq -r '.result' 2>/dev/null)
+    [ -z "$r" ] && return 1
+    if [ "$r" == "false" ]; then echo synced; else echo syncing; fi
+}
+
+ela_height() { local h; h=$(ela_client info getcurrentheight 2>/dev/null);   [[ "$h" =~ ^[0-9]+$ ]] && echo "$h" || return 1; }
+ela_peers()  { local p; p=$(ela_client info getconnectioncount 2>/dev/null); [[ "$p" =~ ^[0-9]+$ ]] && echo "$p" || return 1; }
+
+# unified per-chain probes (ela vs EVM); services (oracle/arbiter) have no height/peers
+chain_height() { case "$1" in ela) ela_height ;; esc|eco|pgp|pg|eid) evm_height "$1" ;; *) return 1 ;; esac; }
+chain_peers()  { case "$1" in ela) ela_peers  ;; esc|eco|pgp|pg|eid) evm_peers  "$1" ;; *) return 1 ;; esac; }
+chain_synced() { case "$1" in ela) ela_synced 2>/dev/null && echo synced || echo syncing ;; esc|eco|pgp|pg|eid) evm_syncing "$1" ;; *) return 1 ;; esac; }
+
+# evm_reward_status <chain> : cold | hot | unset  (hot = reward addr == local keystore acct)
+evm_reward_status()
+{
+    local addr hot kf
+    [ -f "$SCRIPT_PATH/$1/data/miner_address.txt" ] && addr=$(tr -d '[:space:]' < "$SCRIPT_PATH/$1/data/miner_address.txt" 2>/dev/null)
+    echo "$addr" | grep -qiE '^0x[0-9a-f]{40}$' || { echo unset; return; }
+    kf=$(ls "$SCRIPT_PATH/$1/data/keystore/"UTC* 2>/dev/null | head -1)
+    [ -n "$kf" ] && hot=$(jq -r .address "$kf" 2>/dev/null)
+    if [ -n "$hot" ] && [ "$(echo "${addr#0x}" | tr A-Z a-z)" == "$(echo "$hot" | tr A-Z a-z)" ]; then
+        echo hot
+    else
+        echo cold
+    fi
+}
+
+# render_health <chain>: print a one-line verdict; exit 0 healthy, 1 if attention needed.
+# Designed for monitoring/cron: `node.sh esc health && ok || alert`.
+render_health()
+{
+    local chain=$1 p sy
+    "${chain}_installed" 2>/dev/null || { echo "$chain: not installed"; return 1; }
+    chain_running "$chain"           || { echo "$chain: stopped";       return 1; }
+    case "$chain" in
+        *-oracle|arbiter) echo "$chain: running"; return 0 ;;
+    esac
+    sy=$(chain_synced "$chain" 2>/dev/null)
+    p=$(chain_peers  "$chain" 2>/dev/null)
+    if [ -z "$sy" ] || [ -z "$p" ]; then echo "$chain: running (rpc unreachable)"; return 1; fi
+    [ "$sy" == "syncing" ]         && { echo "$chain: syncing";  return 1; }
+    [ -n "$p" ] && [ "$p" == "0" ] && { echo "$chain: no peers"; return 1; }
+    echo "$chain: healthy"; return 0
+}
+
+# render_health_all: health for every chain in the profile; exit non-zero if any unhealthy.
+render_health_all()
+{
+    local chain rc=0
+    for chain in $(profile_chains); do
+        render_health "$chain" || rc=1
+    done
+    return $rc
+}
+
+# render_summary: one row per chain in the active profile (the fleet glance).
+# chain_pid <chain>: the live PID (same detection as chain_running).
+chain_pid()
+{
+    case "$1" in
+        ela)        pgrep -x ela     2>/dev/null | head -1 ;;
+        arbiter)    pgrep -x arbiter 2>/dev/null | head -1 ;;
+        esc|eco|pgp|pg|eid) pgrep -f "^\./$1 .*--rpc " 2>/dev/null | head -1 ;;
+        esc-oracle) pgrep -fx 'node crosschain_oracle.js' 2>/dev/null | head -1 ;;
+        eid-oracle) pgrep -fx 'node crosschain_eid.js'    2>/dev/null | head -1 ;;
+        eco-oracle) pgrep -fx 'node crosschain_eco.js'    2>/dev/null | head -1 ;;
+        pgp-oracle) pgrep -fx 'node crosschain_pgp.js'    2>/dev/null | head -1 ;;
+        pg-oracle)  pgrep -fx 'node crosschain_pg.js'     2>/dev/null | head -1 ;;
+    esac
+}
+
+# render_status_one <chain>: print the chain's full labeled status block (the classic
+# upstream view the operator preferred). Routed to by the default '<chain> status'.
+render_status_one()
+{
+    # the familiar upstream labeled block, verbatim - one aligned field per line
+    "${1}_status"
+}
+
+# render_status_all: a card for every chain in the active profile.
+render_status_all()
+{
+    # one classic labeled block per chain, a blank line between - no extra chrome
+    local chain
+    echo
+    for chain in $(profile_chains); do "${chain}_status"; echo; done
+    echo "  $(ui_dim "one-line glance: $SCRIPT_NAME summary")"
+    echo
+}
+
+render_summary()
+{
+    local prof total=0 running=0 stopped=0 chain st glyph h p sy issues=
+    prof=$(get_profile)
+    echo
+    printf '  %s   profile: %s\n' "$(ui_bold 'Elastos node')" "$prof"
+    printf '  %-12s %-9s %-13s %-6s %s\n' 'CHAIN' 'STATE' 'HEIGHT' 'PEERS' 'HEALTH'
+    printf '  %s\n' '-------------------------------------------------------'
+    for chain in $(profile_chains); do
+        total=$((total + 1)); h='-'; p='-'
+        if ! "${chain}_installed" 2>/dev/null; then
+            st='-'; glyph=$(ui_dim "$UI_DOT_OFF")
+        elif chain_running "$chain"; then
+            st='running'; glyph=$(ui_green "$UI_DOT_OK"); running=$((running + 1))
+            h=$(chain_height "$chain" 2>/dev/null)
+            p=$(chain_peers  "$chain" 2>/dev/null)
+            case "$chain" in
+                *-oracle|arbiter) [ -z "$h" ] && h='-'; [ -z "$p" ] && p='-' ;;
+                *)                [ -z "$h" ] && h='?'; [ -z "$p" ] && p='?' ;;
+            esac
+            sy=$(chain_synced "$chain" 2>/dev/null)
+            if [ "$sy" == "syncing" ]; then glyph=$(ui_yellow "$UI_DOT_WARN"); issues="$issues $chain(syncing)"; fi
+            if [ -n "$p" ] && [ "$p" == "0" ]; then glyph=$(ui_red "$UI_DOT_WARN"); issues="$issues $chain(no-peers)"; fi
+        else
+            st='stopped'; glyph=$(ui_dim "$UI_DOT_OFF"); stopped=$((stopped + 1)); issues="$issues $chain(stopped)"
+        fi
+        printf '  %-12s %-9s %-13s %-6s %s\n' "$chain" "$st" "$h" "$p" "$glyph"
+    done
+    printf '  %s\n' '-------------------------------------------------------'
+    echo "  $(ui_green "$UI_DOT_OK") healthy   $(ui_yellow "$UI_DOT_WARN") syncing/attention   $(ui_dim "$UI_DOT_OFF") stopped"
+    if [ -z "$issues" ]; then
+        echo "  $(ui_green '✓') $running/$total running, all healthy"
+    else
+        echo "  $(ui_yellow '⚠') attention:$issues"
+    fi
+    echo
+}
+
+# chain_health_json <chain> / render_json_one / render_json_all : machine-readable
+chain_health_json()
+{
+    local chain=$1 inst=false run=false h='' p='' sy='' rw=''
+    "${chain}_installed" 2>/dev/null && inst=true
+    if [ "$inst" == true ] && chain_running "$chain"; then
+        run=true
+        h=$(chain_height "$chain" 2>/dev/null)
+        p=$(chain_peers  "$chain" 2>/dev/null)
+        sy=$(chain_synced "$chain" 2>/dev/null)
+        case "$chain" in esc|eco|pgp|pg|eid) rw=$(evm_reward_status "$chain" 2>/dev/null) ;; esac
+    fi
+    jq -n --arg chain "$chain" --argjson installed "$inst" --argjson running "$run" \
+          --arg height "$h" --arg peers "$p" --arg sync "$sy" --arg reward "$rw" \
+        '{chain:$chain, installed:$installed, running:$running,
+          height:(if $height=="" then null else ($height|tonumber) end),
+          peers:(if $peers=="" then null else ($peers|tonumber) end),
+          sync:(if $sync=="" then null else $sync end),
+          reward:(if $reward=="" then null else $reward end)}'
+}
+render_json_one() { chain_health_json "$1"; }
+render_json_all()
+{
+    local chain first=1
+    printf '['
+    for chain in $(profile_chains); do
+        [ $first -eq 1 ] || printf ','
+        first=0
+        chain_health_json "$chain"
+    done
+    printf ']\n'
+}
+
+# noninteractive: true when stdin is not a terminal (cron / CI / pipe). Used to take a
+# safe default instead of blocking on a read prompt.
+noninteractive() { [ ! -t 0 ]; }
+
+# profile_prompt_if_unset: ask main-chain-only vs full stack the first time.
+profile_prompt_if_unset()
+{
+    # When --profile is supplied (PROFILE_OVERRIDE), persist that effective profile so
+    # init/setup and later start/status/health all act on the same chain set. Without
+    # this, `setup --profile mainchain` only inits ELA but leaves PROFILE_FILE unset, so
+    # a later bare `node.sh start` falls back to 'full' on uninitialized side chains.
+    if [ -n "$PROFILE_OVERRIDE" ]; then
+        case "$PROFILE_OVERRIDE" in
+            mainchain|full)
+                if [ "$(cat "$PROFILE_FILE" 2>/dev/null | tr -d '[:space:]')" != "$PROFILE_OVERRIDE" ]; then
+                    set_profile "$PROFILE_OVERRIDE" >/dev/null
+                fi ;;
+        esac
+        return 0
+    fi
+    [ -f "$PROFILE_FILE" ]     && return 0
+    echo "What will this node run?"
+    echo "  [1] Main chain only        (ELA)"
+    echo "  [2] Full stack             (ELA + side chains + oracles + arbiter)"
+    local sel
+    read -p '? Your option: [2] ' sel || { sel=2; echo "  (no input - defaulting to full stack)"; }
+    case "$sel" in
+        1) set_profile mainchain >/dev/null ;;
+        *) set_profile full      >/dev/null ;;
+    esac
+    echo
+}
+
 update_script()
 {
-    #local SCRIPT_URL=https://raw.githubusercontent.com/elastos/Elastos.Node/master/build/skeleton/node.sh
     local SCRIPT_URL=https://raw.githubusercontent.com/MButcho/Elastos.Node/master/build/skeleton/node.sh
+    #local SCRIPT_URL=https://raw.githubusercontent.com/elastos/Elastos.Node/master/build/skeleton/node.sh
+    local SHA_URL=https://raw.githubusercontent.com/elastos/Elastos.Node/master/build/skeleton/node.sh.sha256
 
     local SCRIPT=$SCRIPT_PATH/$(basename $BASH_SOURCE)
     local SCRIPT_TMP=$SCRIPT.tmp
+    local OLD_SHA=$(sha256sum "$SCRIPT" 2>/dev/null | cut -c1-7)
 
-    echo "Downloading $SCRIPT_URL..."
-    curl -# -o $SCRIPT_TMP $SCRIPT_URL
-    if [ "$?" != "0" ]; then
-        echo_error "curl failed"
-        return
+    echo "Downloading node.sh from master..."
+    if ! curl -fsSL -o "$SCRIPT_TMP" "$SCRIPT_URL"; then
+        echo_error "download failed"
+        rm -f "$SCRIPT_TMP"
+        return 1
     fi
 
-    mv $SCRIPT_TMP $SCRIPT
-    chmod a+x $SCRIPT
+    # Integrity: if a published checksum exists, the download MUST match it.
+    local WANT=$(curl -fsSL "$SHA_URL" 2>/dev/null | awk '{print $1}')
+    if [ -n "$WANT" ]; then
+        local GOT=$(sha256sum "$SCRIPT_TMP" 2>/dev/null | awk '{print $1}')
+        if [ "$WANT" != "$GOT" ]; then
+            echo_error "checksum mismatch - refusing to update (want $WANT, got $GOT)"
+            rm -f "$SCRIPT_TMP"
+            return 1
+        fi
+        echo_ok "checksum verified"
+    else
+        echo_warn "no published checksum found - updating without integrity check"
+    fi
 
-    echo_ok "$SCRIPT updated"
+    # Never install a script that does not parse.
+    if ! bash -n "$SCRIPT_TMP"; then
+        echo_error "downloaded script failed syntax check - refusing to update"
+        rm -f "$SCRIPT_TMP"
+        return 1
+    fi
+
+    local NEW_SHA=$(sha256sum "$SCRIPT_TMP" 2>/dev/null | cut -c1-7)
+    local NEW_VER=$(awk -F'"' '/^ELASTOS_NODE_VERSION=/{print $2; exit}' "$SCRIPT_TMP")
+    if [ -z "$NEW_VER" ]; then
+        NEW_VER=$ELASTOS_NODE_VERSION
+        echo_warn "could not read the new version string - reporting the change by checksum only"
+    fi
+
+    # Nothing changed - say so plainly instead of a misleading "updated", and skip the
+    # harden re-exec since no new ports could have been introduced.
+    if [ "$OLD_SHA" == "$NEW_SHA" ]; then
+        rm -f "$SCRIPT_TMP"
+        echo_ok "already up to date: v$ELASTOS_NODE_VERSION (sha $OLD_SHA)"
+        return 0
+    fi
+
+    if ! mv "$SCRIPT_TMP" "$SCRIPT"; then
+        echo_error "could not replace $SCRIPT (immutable bit or read-only path?) - still running the old version"
+        rm -f "$SCRIPT_TMP"
+        return 1
+    fi
+    chmod a+x "$SCRIPT"
+    echo_ok "updated: v$ELASTOS_NODE_VERSION (sha $OLD_SHA) -> v$NEW_VER (sha $NEW_SHA)"
+    echo
+    # Re-exec the JUST-DOWNLOADED script's harden, not the old code still in memory, so
+    # any newly-added ports are closed in the same step (bash never reloads a running file).
+    # No 2>/dev/null here: harden's ufw-inactive/not-installed warnings must reach the operator.
+    "$SCRIPT" harden || harden_firewall
+}
+# has_cold_miner <chain>: true when the chain either does not mine or has a valid
+# cold reward address set. Silent; used by warn_hot_miner and status displays.
+has_cold_miner()
+{
+    local chain=$1
+    is_evm_chain "$chain" || return 0   # only EVM side chains mine
+    local pwfile=~/.config/elastos/${chain}.txt
+    local addrfile=$SCRIPT_PATH/${chain}/data/miner_address.txt
+    [ -f "$pwfile" ] || return 0   # not a mining node; nothing to check
+    local addr=
+    [ -f "$addrfile" ] && addr=$(tr -d '[:space:]' < "$addrfile" 2>/dev/null)
+    echo "$addr" | grep -qiE '^0x[0-9a-f]{40}$'
+}
+
+# warn_hot_miner <chain>: a mining chain with no cold reward address still starts,
+# but the operator is warned in red: rewards credit the node's LOCAL (hot) account.
+warn_hot_miner()
+{
+    local chain=$1
+    has_cold_miner "$chain" && return 0
+    echo "$(ui_red "WARNING: $chain is mining WITHOUT a cold reward address.")"
+    echo "$(ui_red "         Block rewards will credit this node's LOCAL (hot) account.")"
+    echo "  Set one, then restart:  $SCRIPT_NAME reward set 0xYOURCOLDADDRESS"
+    return 0
 }
 
 set_env()
@@ -74,14 +459,19 @@ check_env()
     if [ "$(uname -s)" == "Linux" ]; then
         local DIST_NAME=$(lsb_release -s -i 2>/dev/null)
         local DIST_VER=$(lsb_release -s -r 2>/dev/null)
+        # Minimal images ship no lsb_release; fall back to /etc/os-release (NAME=Ubuntu).
+        if [ -z "$DIST_NAME" ] && [ -r /etc/os-release ]; then
+            DIST_NAME=$(. /etc/os-release 2>/dev/null && echo "$NAME" | cut -d' ' -f1)
+            DIST_VER=$(. /etc/os-release 2>/dev/null && echo "$VERSION_ID")
+        fi
         if [ "$DIST_NAME" == "Ubuntu" ]; then
-            if [ "$DIST_VER" \< "18.04" ]; then
+            if [ -n "$DIST_VER" ] && [ "$DIST_VER" \< "18.04" ]; then
                 echo_error "this script requires Ubuntu 18.04 or higher"
-                exit
+                exit 1
             fi
         else
             echo_error "do not support $(cat /etc/issue)"
-            exit
+            exit 1
         fi
         if [ "$(uname -m)" == "aarch64" ]; then
             # The ARM64 version has not been fully tested.
@@ -90,7 +480,7 @@ check_env()
             local ENABLE_ARM64=
             if [ "$ENABLE_ARM64" == "" ]; then
                 echo_error "do not support $(uname -m)"
-                exit
+                exit 1
             else
                 echo_warn "the arm64 build have not been fully-tested"
             fi
@@ -98,34 +488,43 @@ check_env()
             true
         else
             echo_error "do not support $(uname -m)"
+            exit 1
         fi
     else
         echo_error "do not support $(uname -s)"
-        exit
+        exit 1
     fi
 
-    #echo "Checking sudo permission..."
-    sudo -n true 2>/dev/null
-    if [ "$?" == "0" ]; then
-        echo_warn "it is better to run as a normal user without sudo permission"
-    fi
 
+    # Collect every missing required tool in one pass, then exit non-zero with a
+    # single install command. Dependencies are installed manually by the operator
+    # (see README); node.sh does not install them. rotatelogs ships in apache2-utils.
+    local MISSING_TOOLS=
+    local MISSING_PKGS=
     if [ "$(which jq)" == "" ]; then
-        echo_error "cannot find jq (https://github.com/stedolan/jq)"
-        echo_info "sudo apt-get install -y jq"
-        exit
+        MISSING_TOOLS="$MISSING_TOOLS jq"
+        MISSING_PKGS="$MISSING_PKGS jq"
     fi
-
     if [ "$(which lsof)" == "" ]; then
-        echo_error "cannot find lsof"
-        echo_info "sudo apt-get install -y lsof"
-        exit
+        MISSING_TOOLS="$MISSING_TOOLS lsof"
+        MISSING_PKGS="$MISSING_PKGS lsof"
     fi
-
     if [ "$(which rotatelogs)" == "" ]; then
-        echo_error "cannot find rotatelogs"
-        echo_info "sudo apt-get install -y apache2-utils"
-        exit
+        MISSING_TOOLS="$MISSING_TOOLS rotatelogs"
+        MISSING_PKGS="$MISSING_PKGS apache2-utils"
+    fi
+    if [ "$(which curl)" == "" ]; then
+        MISSING_TOOLS="$MISSING_TOOLS curl"
+        MISSING_PKGS="$MISSING_PKGS curl"
+    fi
+    if [ "$(which openssl)" == "" ]; then
+        MISSING_TOOLS="$MISSING_TOOLS openssl"
+        MISSING_PKGS="$MISSING_PKGS openssl"
+    fi
+    if [ -n "$MISSING_TOOLS" ]; then
+        echo_error "missing required tool(s):$MISSING_TOOLS"
+        echo_info "install them with: sudo apt-get install -y$MISSING_PKGS"
+        exit 1
     fi
 
     if [ "${BASH_ARGV[0]}" == "init" ]; then
@@ -156,7 +555,10 @@ check_env_oracle()
 
 init_config()
 {
-    local CONFIG_FILE=~/.config/elastos/${SCRIPT_NAME%.*}.json
+    # the network config is always node.json (Elastos convention), independent of the
+    # script's filename - so running this as e.g. node.sh.new (migration rehearsal) still
+    # finds the existing config instead of prompting and writing a stray file.
+    local CONFIG_FILE=~/.config/elastos/node.json
 
     if [ -f $CONFIG_FILE ]; then
         echo_error "$CONFIG_FILE exist"
@@ -171,7 +573,7 @@ init_config()
     local SELECT=
     while true; do
         echo
-        read -p '? Your option: [1] ' SELECT
+        read -p '? Your option: [1] ' SELECT || { SELECT=1; echo_info "no input - defaulting to MainNet"; }
 
         if [ "$SELECT" == "" ] || [ "$SELECT" == "1" ]; then
             local CHAIN_TYPE=mainnet
@@ -201,11 +603,15 @@ EOF
 
 load_config()
 {
-    local CONFIG_FILE=~/.config/elastos/${SCRIPT_NAME%.*}.json
+    # the network config is always node.json (Elastos convention), independent of the
+    # script's filename - so running this as e.g. node.sh.new (migration rehearsal) still
+    # finds the existing config instead of prompting and writing a stray file.
+    local CONFIG_FILE=~/.config/elastos/node.json
 
     if [ ! -f $CONFIG_FILE ]; then
+        # First run: choose the network and write the config, then CONTINUE with the
+        # requested command instead of exiting (no more running the command twice).
         init_config
-        exit
     fi
 
     export CHAIN_TYPE=$(cat $CONFIG_FILE | jq -r '.["chain-type"]')
@@ -267,6 +673,28 @@ set_cron()
     fi
 
     crontab -l 2>/dev/null
+}
+
+# swap: ensure 16G of active swap (sync headroom). Keys on ACTIVE swap, not file
+# existence, so a leftover-but-inactive /swapfile from a prior run is recovered
+# rather than skipped. Optional - run it on small-RAM boxes before the first sync.
+swap()
+{
+    if [ "$(swapon --show 2>/dev/null | wc -l)" -eq 0 ]; then
+        if [ ! -f /swapfile ]; then
+            sudo fallocate -l 16G /swapfile && sudo chmod 600 /swapfile
+        else
+            echo "found inactive /swapfile - activating it"
+            sudo chmod 600 /swapfile
+        fi
+        sudo mkswap /swapfile && sudo swapon /swapfile
+        grep -q '^/swapfile ' /etc/fstab 2>/dev/null || \
+            echo '/swapfile swap swap defaults 0 0' | sudo tee -a /etc/fstab >/dev/null
+        echo_ok "16G swap active"
+    else
+        echo "swap already active - nothing to do"
+        swapon --show
+    fi
 }
 
 extip()
@@ -562,7 +990,7 @@ get_elastos_ver_latest()
         return
     fi
 
-    curl -s "$1/?F=1" | grep '\[DIR\]' \
+    curl -s --connect-timeout 10 --max-time 30 "$1/?F=1" | grep '\[DIR\]' \
         | sed -e 's/.*href="//' -e 's/".*//' -e 's/.*-//' -e 's/\/$//' \
         | sort -Vr | head -n 1
 }
@@ -705,86 +1133,974 @@ chain_prepare_stage()
 #
 # all
 #
+#
+# Deployment profile: mainchain-only vs the full cross-chain stack.
+#
+# Not every operator runs the whole stack. The profile is chosen once (persisted
+# to PROFILE_FILE) and governs the bulk commands (all_*) and the status summary.
+# An individual chain always works directly (e.g. `node.sh esc start`).
+# ECO and PGP are intentionally excluded (decommissioned).
+#
+PROFILE_FILE=~/.config/elastos/profile
+PROFILE_DEFAULT=full
+PROFILE_CHAINS_FULL="ela esc esc-oracle eid eid-oracle pg pg-oracle arbiter"
+PROFILE_CHAINS_MAINCHAIN="ela"
+
+# get_profile: echo the active profile, honoring --profile override, then the
+# persisted file, then the default. Always echoes a valid value.
+get_profile()
+{
+    local p="$PROFILE_OVERRIDE"
+    if [ -z "$p" ] && [ -f "$PROFILE_FILE" ]; then
+        p=$(cat "$PROFILE_FILE" 2>/dev/null | tr -d '[:space:]')
+    fi
+    case "$p" in
+        mainchain|full) echo "$p" ;;
+        *)              echo "$PROFILE_DEFAULT" ;;
+    esac
+}
+
+# profile_chains: ordered chain list for the active profile (start order).
+profile_chains()
+{
+    if [ "$(get_profile)" == "mainchain" ]; then
+        echo "$PROFILE_CHAINS_MAINCHAIN"
+    else
+        echo "$PROFILE_CHAINS_FULL"
+    fi
+}
+
+# set_profile <mainchain|full>: persist the operator's choice.
+set_profile()
+{
+    case "$1" in
+        mainchain|full)
+            mkdir -p "$(dirname "$PROFILE_FILE")"
+            echo "$1" > "$PROFILE_FILE"
+            echo "Deployment profile set to: $1"
+            echo "Active chains: $(profile_chains)"
+            ;;
+        *)
+            echo_error "unknown profile: '$1' (expected 'mainchain' or 'full')"
+            return 1
+            ;;
+    esac
+}
+
+# profile [set <p>]: show or change the deployment profile.
+profile()
+{
+    if [ "$1" == "set" ]; then
+        set_profile "$2"
+        return
+    fi
+    echo "Deployment profile: $(get_profile)"
+    echo "Active chains:      $(profile_chains)"
+    echo
+    echo "  mainchain   ELA mainchain only"
+    echo "  full        ELA + side chains (esc, eid, pg) + oracles + arbiter"
+    echo
+    echo "Change with: $SCRIPT_NAME profile set [mainchain|full]"
+}
+
+# firewall: open the peer + consensus ports for the active profile.
+# RPC/WS are deliberately NOT opened - they bind to 127.0.0.1 and must stay private.
+firewall()
+{
+    if ! command -v ufw >/dev/null 2>&1; then
+        echo_error "ufw not found (sudo apt-get install -y ufw)"; return 1
+    fi
+    local prof p port ssh_ports= ANSWER
+    prof=$(get_profile)
+
+    # Detect the real SSH port(s) so enabling ufw can never lock out this session. We gather
+    # from every reliable source; only when NOTHING is found do we fall back to 22 - and in
+    # that case we refuse to auto-enable, because a wrong guess locks an operator out of a
+    # headless box (provider rescue console required to recover):
+    #   - $SSH_CONNECTION's 4th field: the local port THIS session arrived on (always set in a
+    #     login shell; absent under su / a reattached tmux / an env-scrubbed sudo)
+    #   - sshd -T: the daemon's effective config (needs root to read host keys; try via sudo -n)
+    #   - sshd_config + its drop-ins: explicit 'Port' directives, readable without root
+    local ssh_detected= ssh_cfgs=/etc/ssh/sshd_config
+    compgen -G "/etc/ssh/sshd_config.d/*.conf" >/dev/null 2>&1 && ssh_cfgs="$ssh_cfgs /etc/ssh/sshd_config.d/*.conf"
+    for p in $(echo "$SSH_CONNECTION" | awk '{print $4}') \
+             $(sudo -n sshd -T 2>/dev/null | awk '/^port /{print $2}') \
+             $(awk '/^[Pp]ort /{print $2}' $ssh_cfgs 2>/dev/null); do
+        [ -n "$p" ] || continue
+        case " $ssh_ports " in *" $p "*) ;; *) ssh_ports="$ssh_ports $p"; ssh_detected=1 ;; esac
+    done
+    ssh_ports=$(echo $ssh_ports)
+    [ -z "$ssh_ports" ] && ssh_ports=22
+
+    # Build the full list of rules (SSH first, then the profile's peer/consensus ports).
+    # RPC/WS are deliberately NOT opened - they bind to 127.0.0.1 and must stay private.
+    local cmds=
+    for port in $ssh_ports; do
+        cmds="${cmds:+$cmds\n}sudo ufw allow $port/tcp   # SSH"
+    done
+    cmds="$cmds\nsudo ufw allow 20338/tcp   # ELA P2P"
+    cmds="$cmds\nsudo ufw allow 20339/tcp   # ELA DPoS"
+    if [ "$prof" == "full" ]; then
+        for p in 20638 20648 20678; do    # EVM devp2p (tcp + udp discovery)
+            cmds="$cmds\nsudo ufw allow $p/tcp"
+            cmds="$cmds\nsudo ufw allow $p/udp"
+        done
+        for p in 20639 20649 20679; do    # EVM PBFT consensus
+            cmds="$cmds\nsudo ufw allow $p/tcp"
+        done
+    fi
+
+    echo "Firewall plan for profile '$prof' (RPC stays on 127.0.0.1):"
+    if [ -n "$ssh_detected" ]; then
+        echo "  detected SSH port(s): $ssh_ports"
+    else
+        echo "  SSH port(s): could not detect - assuming 22 (UNVERIFIED)"
+    fi
+    echo
+    echo -e "$cmds" | sed 's/^/  /'
+    echo "  sudo ufw --force enable"
+    echo
+    if [ -z "$ssh_detected" ]; then
+        echo_warn "could not confirm this session's SSH port - run 'node.sh firewall' directly over SSH (not via su/tmux/sudo) so it can auto-detect the port"
+        echo_warn "refusing to auto-enable: enabling ufw on an unverified SSH port can lock you out of a headless host"
+        echo "Review the commands above, set your real SSH port, and run them by hand when ready."
+        return 0
+    fi
+    echo_warn "this enables the host firewall; only the ports above stay reachable"
+    read -p "Apply these rules and enable the firewall? (Yes/No) " ANSWER || { ANSWER=No; echo_warn "no input - not enabling the firewall"; }
+    case "$ANSWER" in
+        Yes|yes|y) ;;
+        *) echo "Skipped - firewall not enabled. Run the commands above by hand when ready."; return 0 ;;
+    esac
+
+    for port in $ssh_ports; do
+        sudo ufw allow $port/tcp >/dev/null   # SSH
+    done
+    sudo ufw allow 20338/tcp >/dev/null   # ELA P2P
+    sudo ufw allow 20339/tcp >/dev/null   # ELA DPoS
+    if [ "$prof" == "full" ]; then
+        for p in 20638 20648 20678; do    # EVM devp2p (tcp + udp discovery)
+            sudo ufw allow $p/tcp >/dev/null
+            sudo ufw allow $p/udp >/dev/null
+        done
+        for p in 20639 20649 20679; do    # EVM PBFT consensus
+            sudo ufw allow $p/tcp >/dev/null
+        done
+    fi
+    sudo ufw --force enable >/dev/null
+    echo_ok "firewall configured (SSH allowed on: $ssh_ports)"
+    sudo ufw status verbose
+}
+
+# Unauthenticated local-only ports that must never face the internet: the EVM RPC/WS and
+# the crosschain oracle HttpJsonPorts. They have no access control and are reached over
+# loopback by the local geth / arbiter / CLI, so harden closes them.
+# NOT included: the ELA RPC (20336) and arbiter RPC (20536). Those are authenticated (ELA
+# by the config WhiteIPList, arbiter by an RPC user/password) and are the endpoints
+# read-only monitors use, so the operator controls them (scope a firewall rule to the
+# monitor's IP). P2P + consensus ports stay open via the firewall command.
+RPC_FIREWALL_PORTS="20635 20636 20645 20646 20655 20656 20675 20676 20632 20642 20652 20672"
+
+# harden_firewall: close public access to the RPC/WS ports. Safe, reversible, idempotent,
+# and it never restarts a daemon - so syncing and consensus are untouched. Returns 0.
+harden_firewall()
+{
+    local port closed=
+    if ! command -v ufw >/dev/null 2>&1; then
+        echo_warn "ufw not installed - make sure your cloud firewall blocks 20636/20646/20676 from the internet"
+        return 0
+    fi
+    if ! ufw status 2>/dev/null | grep -q "Status: active"; then
+        echo_warn "ufw inactive - make sure your cloud firewall blocks 20636/20646/20676 from the internet"
+        return 0
+    fi
+    for port in $RPC_FIREWALL_PORTS; do
+        if ufw status 2>/dev/null | grep -qE "^${port}/tcp[[:space:]].*ALLOW"; then
+            sudo ufw delete allow ${port}/tcp >/dev/null 2>&1 && closed="$closed $port"
+        fi
+    done
+    if [ -n "$closed" ]; then
+        echo_ok "firewall: closed public access to RPC ports:$closed"
+    else
+        echo_ok "firewall: no public RPC ports were open"
+    fi
+    return 0
+}
+
+# harden: the firewall close above, plus a report of which running EVM daemons still
+# bind 0.0.0.0 (and so need a restart to fully rebind to 127.0.0.1). Restarts nothing.
+harden()
+{
+    local chain pid cmd exposed=
+    ui_bold "Harden - close public RPC exposure"; echo
+    harden_firewall
+    echo
+    for chain in $EVM_CHAINS; do
+        pid=$(pgrep -f "^\./$chain .*--rpc " 2>/dev/null | head -1)
+        [ -z "$pid" ] && continue
+        cmd=$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null)
+        if echo "$cmd" | grep -qE -- '0[.]0[.]0[.]0|--unlock '; then
+            echo "  $(ui_yellow '!') $chain still bound to 0.0.0.0 - restart to rebind:  $SCRIPT_NAME $chain restart"
+            exposed=1
+        fi
+    done
+    if [ -n "$exposed" ]; then
+        echo
+        echo "  The firewall change already blocks the internet. The restart is defense-in-depth"
+        echo "  (rebinds RPC to 127.0.0.1, drops --unlock/personal) - do it after each chain is synced."
+    else
+        echo_ok "all running EVM daemons are bound to 127.0.0.1"
+    fi
+}
+
+
+# ---------------------------------------------------------------------------
+# monitor: enroll this node with a read-only push monitor. The node reports its
+# own status OUTBOUND over HTTPS - it never shares an RPC password and never opens
+# an inbound port. Identity is the node's on-chain consensus public key, which the
+# monitor matches against the public producer / CR lists it already fetches.
+#
+#   monitor <https-url> | enable <url>   enroll and start reporting
+#   monitor report                       collect status and push once (run by cron)
+#   monitor status                       show enrollment state
+#   monitor disable | off                stop reporting and forget the monitor
+#
+# ~/.config/elastos/monitor.json (chmod 600) holds {url, token, seq}. The token is
+# a self-generated 256-bit secret; only its SHA-256 is ever sent to the monitor, so
+# a monitor breach cannot recover it. Enrollment is automatic - the node is active
+# immediately and locked to this token, so nobody can later hijack its identity.
+# Re-running enroll is a safe no-op. Nothing here changes an RPC password or
+# restarts a chain.
+# ---------------------------------------------------------------------------
+MONITOR_CONFIG=~/.config/elastos/monitor.json
+MONITOR_SCHEMA=1
+MONITOR_CRON_TAG="monitor report"
+
+# monitor_sha256: hex SHA-256 of stdin (hashes the push token before it is sent).
+monitor_sha256()
+{
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | cut -d' ' -f1
+    else
+        shasum -a 256 | cut -d' ' -f1
+    fi
+}
+
+# monitor_pubkey: this node's ELA consensus public key, or empty when there is no
+# keystore (a plain full node has no on-chain identity to report).
+monitor_pubkey()
+{
+    [ -f ~/.config/elastos/ela.txt ] || return 0
+    ( cd "$SCRIPT_PATH/ela" 2>/dev/null && ela_client wallet account 2>/dev/null |
+        sed -n '3 s/^.* //p' )
+}
+
+# monitor_setup_type <pubkey>: classify the node from the public on-chain lists.
+# "producer" / "council" when the key is registered, "fullnode" when it is in neither
+# list, "unknown" when ELA cannot be reached (the admin classifies it instead).
+monitor_setup_type()
+{
+    local pub=$1 producers crs
+    [ -z "$pub" ] && { echo fullnode; return; }
+    producers=$(ela_jsonrpc listproducers state all 2>/dev/null)
+    [ -z "$producers" ] && { echo unknown; return; }
+    if echo "$producers" | jq -e --arg p "$pub" \
+            '.result.producers[]? | select(.nodepublickey == $p)' >/dev/null 2>&1; then
+        echo producer; return
+    fi
+    crs=$(ela_jsonrpc listcurrentcrs state all 2>/dev/null)
+    if echo "$crs" | jq -e --arg p "$pub" \
+            '.result.crmembersinfo[]? | select(.dpospublickey == $p)' >/dev/null 2>&1; then
+        echo council; return
+    fi
+    echo fullnode
+}
+
+# monitor_install_cron: add the once-a-minute push timer, idempotently.
+monitor_install_cron()
+{
+    crontab -l 2>/dev/null | grep -qF "$SCRIPT_NAME $MONITOR_CRON_TAG" && return 0
+    ( crontab -l 2>/dev/null
+      echo "* * * * * $SCRIPT_PATH/$SCRIPT_NAME monitor report" ) | crontab -
+}
+
+# monitor_remove_cron: drop the push timer, idempotently.
+monitor_remove_cron()
+{
+    crontab -l 2>/dev/null | grep -qF "$SCRIPT_NAME $MONITOR_CRON_TAG" || return 0
+    ( crontab -l 2>/dev/null | grep -vF "$SCRIPT_NAME $MONITOR_CRON_TAG" ) | crontab -
+}
+
+# monitor_enable <url> [--insecure]: enroll and start reporting.
+monitor_enable()
+{
+    local url=$1
+    if [ -z "$url" ]; then
+        echo_error "usage: $SCRIPT_NAME monitor <https-url>"
+        exit 1
+    fi
+    # accept a bare host/IP and assume https; refuse plain http unless --insecure
+    case "$url" in
+        https://*) ;;
+        http://*)  if [ "$2" != "--insecure" ]; then
+                       echo_error "refusing plain http - the token would be sniffable. Use https, or pass --insecure on a trusted LAN."
+                       exit 1
+                   fi ;;
+        *)         url="https://$url" ;;
+    esac
+    url=${url%/}
+
+    # idempotent: already enrolled to this url -> just make sure the timer exists
+    if [ -f "$MONITOR_CONFIG" ]; then
+        local cur=$(jq -r '.url // empty' "$MONITOR_CONFIG" 2>/dev/null)
+        if [ "$cur" == "$url" ]; then
+            monitor_install_cron
+            echo_ok "already monitoring -> $url"
+            echo "  run '$SCRIPT_NAME monitor status' to see the last report"
+            return 0
+        fi
+        echo_warn "this node already reports to $cur"
+        if noninteractive; then
+            echo_error "re-point needs confirmation - run interactively, or '$SCRIPT_NAME monitor disable' first"
+            exit 1
+        fi
+        local ANSWER
+        read -p "? switch to $url ? [y/N] " ANSWER
+        case "$ANSWER" in y|Y|yes) ;; *) echo "Aborted."; exit 1 ;; esac
+    fi
+
+    ui_bold "Monitor - enroll this node"; echo
+
+    # Enrolling only sets up OUTBOUND reporting; it must not touch the firewall.
+    # (Closing RPC ports is a deliberate, separate step: run 'node.sh harden'.)
+    # Doing it here would break any read-only monitor still polling this node's
+    # side-chain RPC over those ports.
+
+    local pub=$(monitor_pubkey)
+    local stype=$(monitor_setup_type "$pub")
+    local ip=$(extip)
+    if [ -z "$ip" ]; then
+        echo_error "could not determine this node's public IP (is the box online?)"
+        exit 1
+    fi
+
+    # self-minted 256-bit token; only its hash leaves the box
+    local token=$(openssl rand -hex 32)
+    local thash=$(printf %s "$token" | monitor_sha256)
+
+    local body=$(jq -n --argjson schema "$MONITOR_SCHEMA" --arg ip "$ip" \
+        --arg pub "$pub" --arg stype "$stype" --arg thash "$thash" \
+        --arg ver "$ELASTOS_NODE_VERSION" \
+        '{schema:$schema, publicIp:$ip,
+          dposPublicKey:(if $pub=="" then null else $pub end),
+          setupType:$stype, tokenHash:$thash, nodeVersion:$ver}')
+
+    local raw http resp
+    raw=$(curl -s -w '\n%{http_code}' --max-time 15 -X POST "$url/api/register" \
+        -H 'Content-Type: application/json' -d "$body" 2>/dev/null)
+    http=${raw##*$'\n'}
+    resp=${raw%$'\n'*}
+    if [ -z "$http" ] || [ "$http" = "000" ]; then
+        echo_error "no response from $url/api/register - check the URL is correct and reachable"
+        exit 1
+    fi
+    if [ "$http" != "200" ]; then
+        # e.g. the identity is already enrolled to a different node (first-writer lock)
+        local emsg=$(printf '%s' "$resp" | jq -r '.error // empty' 2>/dev/null)
+        echo_error "monitor refused enrollment (HTTP $http)${emsg:+: $emsg}"
+        exit 1
+    fi
+
+    mkdir -p  $(dirname $MONITOR_CONFIG)
+    chmod 700 $(dirname $MONITOR_CONFIG)
+    touch $MONITOR_CONFIG
+    chmod 600 $MONITOR_CONFIG
+    jq -n --arg url "$url" --arg token "$token" --argjson seq 0 \
+        '{url:$url, token:$token, seq:$seq}' > $MONITOR_CONFIG
+    chmod 600 $MONITOR_CONFIG
+
+    monitor_install_cron
+    echo_ok "enrolled with $url"
+    echo "  identity: ${stype}${pub:+ ($pub)}"
+    echo "  IP reported: $ip"
+    monitor_report
+    echo
+    # The monitor keeps NO record until this node's key is on the on-chain
+    # BPoS/council list (register returns tracked:false until then); the timer
+    # keeps reporting so it enrolls automatically the moment the key appears.
+    # NB: use an explicit if/else, not `.tracked // empty` - jq's `//` treats a
+    # literal `false` as empty, so `.tracked // empty` would print "" for
+    # {"tracked":false} and this branch would never fire.
+    local tracked=$(printf '%s' "$resp" | jq -r 'if .tracked==false then "false" else "" end' 2>/dev/null)
+    if [ "$tracked" = "false" ]; then
+        echo "  not on the BPoS/council list yet - reporting every minute; once your key is"
+        echo "  on-chain (after you claim) the node enrolls automatically and appears on the monitor."
+    else
+        echo "  reporting every minute - your node will appear on the monitor shortly."
+    fi
+}
+
+# monitor_report: collect this node's status and push it once. Run by cron; also
+# called at the end of enroll. Stays quiet unless run interactively.
+monitor_report()
+{
+    if [ ! -f "$MONITOR_CONFIG" ]; then
+        echo_error "not enrolled - run '$SCRIPT_NAME monitor <https-url>'"
+        return 1
+    fi
+    local url=$(jq -r '.url' "$MONITOR_CONFIG")
+    local token=$(jq -r '.token' "$MONITOR_CONFIG")
+    local seq=$(jq -r '.seq // 0' "$MONITOR_CONFIG")
+    seq=$((seq + 1))
+
+    local pub=$(monitor_pubkey)
+    local ip=$(extip)
+    local now=$(date +%s)
+
+    local chains=$(render_json_all 2>/dev/null)
+    echo "$chains" | jq . >/dev/null 2>&1 || chains='[]'
+
+    local envelope=$(jq -n --argjson schema "$MONITOR_SCHEMA" --arg ver "$ELASTOS_NODE_VERSION" \
+        --arg pub "$pub" --arg ip "$ip" --argjson ts "$now" --argjson seq "$seq" \
+        --argjson chains "$chains" \
+        '{schema:$schema, nodeVersion:$ver,
+          dposPublicKey:(if $pub=="" then null else $pub end),
+          publicIp:$ip, capturedAt:$ts, seq:$seq, chains:$chains}')
+
+    # Capture the body too (not just the code) so we can tell a node that is
+    # merely "not on-chain yet" (reason=not_on_chain, will enroll on claim) from
+    # one an admin actually disabled.
+    local raw=$(curl -s -w '\n%{http_code}' --max-time 15 \
+        -X POST "$url/api/status" \
+        -H 'Content-Type: application/json' \
+        -H "Authorization: Bearer $token" -d "$envelope" 2>/dev/null)
+    local code=${raw##*$'\n'}
+    local rbody=${raw%$'\n'*}
+    local reason=$(printf '%s' "$rbody" | jq -r '.reason // empty' 2>/dev/null)
+
+    jq --argjson seq "$seq" --argjson ts "$now" --arg code "$code" --arg reason "$reason" \
+        '.seq=$seq | .lastReportAt=$ts | .lastCode=$code | .lastReason=$reason' "$MONITOR_CONFIG" \
+        > "$MONITOR_CONFIG.tmp" 2>/dev/null \
+        && mv "$MONITOR_CONFIG.tmp" "$MONITOR_CONFIG" && chmod 600 "$MONITOR_CONFIG"
+
+    if ! noninteractive; then
+        case "$code" in
+            2*)  echo_ok "report sent (accepted)" ;;
+            403) if [ "$reason" = "not_on_chain" ]; then
+                     echo_warn "report sent - not on the BPoS/council list yet; enrolls automatically once your key is on-chain"
+                 else
+                     echo_warn "report sent - this node is not active (disabled on the monitor?)"
+                 fi ;;
+            000|"") echo_error "could not reach $url" ;;
+            *)   echo_warn "report sent - monitor returned HTTP $code" ;;
+        esac
+    fi
+}
+
+# monitor_status: show whether this node is enrolled and when it last reported.
+monitor_status()
+{
+    if [ ! -f "$MONITOR_CONFIG" ]; then
+        echo "Monitoring: off (not enrolled)"
+        echo "  enroll with: $SCRIPT_NAME monitor <https-url>"
+        return 0
+    fi
+    local url=$(jq -r '.url' "$MONITOR_CONFIG")
+    local last=$(jq -r '.lastReportAt // empty' "$MONITOR_CONFIG")
+    local code=$(jq -r '.lastCode // empty' "$MONITOR_CONFIG")
+    local reason=$(jq -r '.lastReason // empty' "$MONITOR_CONFIG")
+    echo "Monitoring: on"
+    echo "  monitor: $url"
+    if [ -n "$last" ]; then
+        local now=$(date +%s)
+        echo "  last report: $((now - last))s ago (HTTP ${code:-?})"
+    else
+        echo "  last report: never"
+    fi
+    case "$code" in
+        2*)  echo "  state: active - reports accepted" ;;
+        403) if [ "$reason" = "not_on_chain" ]; then
+                 echo "  state: waiting - not on the BPoS/council list yet (enrolls once your key is on-chain)"
+             else
+                 echo "  state: not active - this node was disabled on the monitor"
+             fi ;;
+        "")  ;;
+        *)   echo "  state: error (HTTP $code) - check the monitor URL" ;;
+    esac
+    if crontab -l 2>/dev/null | grep -qF "$SCRIPT_NAME $MONITOR_CRON_TAG"; then
+        echo "  push timer: installed (every minute)"
+    else
+        echo "  push timer: MISSING - run '$SCRIPT_NAME monitor $url' to reinstall"
+    fi
+}
+
+# monitor_disable: stop reporting and forget the monitor. Does not touch RPC config.
+monitor_disable()
+{
+    if [ ! -f "$MONITOR_CONFIG" ]; then
+        echo_ok "monitoring already off"
+        monitor_remove_cron
+        return 0
+    fi
+    local url=$(jq -r '.url' "$MONITOR_CONFIG")
+    local token=$(jq -r '.token' "$MONITOR_CONFIG")
+    curl -s --max-time 10 -X POST "$url/api/status" \
+        -H 'Content-Type: application/json' \
+        -H "Authorization: Bearer $token" -d '{"disabling":true}' >/dev/null 2>&1
+    monitor_remove_cron
+    rm -f "$MONITOR_CONFIG"
+    echo_ok "monitoring disabled - token forgotten, push timer removed"
+    echo "  note: your RPC password is unchanged and no chain was restarted."
+}
+
+# monitor_cmd: dispatch the monitor subcommand. A bare host/IP/URL enrolls.
+monitor_cmd()
+{
+    local sub=$1
+    case "$sub" in
+        ""|status)               monitor_status ;;
+        report)                  monitor_report ;;
+        disable|off|stop)        monitor_disable ;;
+        enable)                  shift; monitor_enable "$@" ;;
+        -h|--help|help)
+            echo "usage: $SCRIPT_NAME monitor <https-url>"
+            echo "  (run '$SCRIPT_NAME monitor' alone to check it, '$SCRIPT_NAME monitor off' to stop)" ;;
+        https://*|http://*|*.*|*:*) monitor_enable "$@" ;;
+        *)
+            echo_error "unknown monitor subcommand: $sub"
+            echo "  usage: $SCRIPT_NAME monitor <https-url> | report | status | disable"
+            exit 1 ;;
+    esac
+}
+
+
+# keystore_present <chain>: 0 if a real keystore exists for the chain, 1 otherwise.
+# ela keeps a single keystore.dat; esc/eid/pg keep an EVM account file under data/keystore.
+keystore_present()
+{
+    case "$1" in
+        ela) [ -f "$SCRIPT_PATH/ela/keystore.dat" ] ;;
+        *)   ls "$SCRIPT_PATH/$1/data/keystore/"UTC* >/dev/null 2>&1 ;;
+    esac
+}
+
+# clean_orphaned_config: a deleted ~/node can leave ~/.config/elastos/<chain>.txt
+# (keystore passwords) with no matching keystore, which makes init bail half-way and
+# leaves a broken half-install. Detect that split-brain and offer to clear it.
+clean_orphaned_config()
+{
+    local chain orphan= ANSWER
+    for chain in ela esc eid pg; do
+        [ -f ~/.config/elastos/$chain.txt ] && [ ! -f "$SCRIPT_PATH/$chain/.init" ] && ! keystore_present "$chain" && orphan="$orphan $chain"
+    done
+    [ -z "$orphan" ] && return 0
+    echo
+    echo_warn "leftover keystore passwords from a previous install (no matching keystore):$orphan"
+    echo "  these block init and have no matching keystore on this host, so they are useless."
+    read -p "Remove them so init can proceed? (Yes/No) " ANSWER || { ANSWER=No; echo_warn "no input - leaving password files in place (remove manually if truly orphaned)"; }
+    case "$ANSWER" in
+        Yes|yes|y) for chain in $orphan; do rm -f ~/.config/elastos/$chain.txt && echo_ok "removed $chain.txt"; done ;;
+        *) echo_warn "left in place - init will fail for:$orphan  (remove them or run '$SCRIPT_PATH/$SCRIPT_NAME uninstall')" ;;
+    esac
+}
+
+setup()
+{
+    echo "=== Elastos node setup (initialize chains) ==="
+    profile_prompt_if_unset
+    local prof; prof=$(get_profile)
+    echo "This initializes the '$prof' profile: it downloads the chain binaries and creates"
+    echo "the keystores. Dependencies, swap, and the firewall are separate steps (see"
+    echo "'Next steps'). Dependencies must already be installed; check_env reports the exact"
+    echo "apt-get line for any that are missing."
+    local ANSWER
+    read -p "Proceed (Yes/No)? " ANSWER
+    if [ "$ANSWER" != "Yes" ] && [ "$ANSWER" != "yes" ] && [ "$ANSWER" != "y" ]; then
+        echo "Aborted."; return 1
+    fi
+
+    all_init
+
+    echo; echo_ok "chains initialized ('$prof' profile)"
+    echo "Next steps:"
+    echo "  - (optional) add 16G swap headroom for the initial sync:  node.sh swap"
+    echo "  - open the peer/consensus ports (detects your SSH port, asks first):"
+    echo "       node.sh firewall"
+    if [ "$prof" == "full" ]; then
+        echo "  - side-chain reward addresses came from the \"Miner Address\" init prompts;"
+        echo "    to change one to a cold address:  node.sh reward set 0x<your-cold-address>"
+    fi
+    echo "  - enable autostart on reboot:  node.sh set_cron"
+    echo "  - start:  node.sh start     then check:  node.sh status"
+    echo "  - after full sync, get the 02/03... public key for Essentials:"
+    echo "       node.sh ela status --verbose"
+}
+
+# chain_restart <chain>: stop, wait for exit, start.
+chain_restart()
+{
+    local chain=$1 i
+    # never restart ELA unless explicitly forced - it would interrupt council consensus
+    if [ "$chain" == "ela" ] && [ "$FORCE_ELA" != "1" ]; then
+        echo_warn "ela restart refused: it would interrupt council consensus. Re-run with --force to include it."
+        return 0
+    fi
+    "${chain}_stop"
+    for i in 1 2 3 4 5; do chain_running "$chain" || break; sleep 1; done
+    "${chain}_start"
+}
+
+# all_restart: restart every chain in the active profile, one at a time.
+all_restart()
+{
+    local chain failed=
+    for chain in $(profile_chains); do
+        "${chain}_installed" 2>/dev/null || continue
+        chain_restart "$chain" || failed="$failed $chain"
+    done
+    if [ -n "$failed" ]; then
+        echo; echo_error "these chains did not restart:$failed"
+        return 1
+    fi
+    return 0
+}
+
+# chain_logs <chain> [-f]: tail the chain's most recent log (-f to follow).
+chain_logs()
+{
+    local chain=$1 follow= log
+    { [ "$2" == "-f" ] || [ "$2" == "--follow" ]; } && follow=1
+    log=$(ls -t "$SCRIPT_PATH/$chain/logs/"*.log "$SCRIPT_PATH/$chain/elastos/logs/node/"*.log 2>/dev/null | head -1)
+    if [ -z "$log" ]; then echo_error "no logs found for $chain yet"; return 1; fi
+    ui_dim "==> $log <=="; echo
+    if [ -n "$follow" ]; then tail -n 40 -f "$log"; else tail -n 60 "$log"; fi
+}
+
+# logs_cmd [<chain>] [-f]: global `logs`, defaults to the mainchain.
+logs_cmd()
+{
+    local chain=$1 flag=$2
+    if [ -z "$chain" ] || [ "$chain" == "-f" ] || [ "$chain" == "--follow" ]; then
+        flag=$chain; chain=ela
+    fi
+    chain_logs "$chain" "$flag"
+}
+
+# version_cmd: tool version + each installed chain binary version.
+version_cmd()
+{
+    echo "Elastos Node for Ubuntu $(ui_bold "v$ELASTOS_NODE_VERSION")"
+    ui_dim "node.sh sha:$SCRIPT_SHA1   profile:$(get_profile)"; echo
+    local chain
+    for chain in $(profile_chains); do
+        case "$chain" in *-oracle|arbiter) continue ;; esac
+        "${chain}_installed" 2>/dev/null && echo "  $("${chain}_ver" 2>/dev/null)"
+    done
+}
+
+# reward_cmd [set <0x..>]: show or set the cold miner reward address (EVM side chains).
+reward_cmd()
+{
+    local chain addr
+    if [ "$1" != "set" ]; then
+        echo "Cold reward address per side chain:"
+        for chain in esc eid pg; do
+            if [ -f "$SCRIPT_PATH/$chain/data/miner_address.txt" ]; then
+                echo "  $chain  $(cat "$SCRIPT_PATH/$chain/data/miner_address.txt")"
+            else
+                echo "  $chain  $(ui_yellow '(unset)')"
+            fi
+        done
+        echo; echo "Set for all side chains:  $SCRIPT_NAME reward set 0xYOURCOLDADDRESS"
+        return
+    fi
+    addr=$2
+    if ! echo "$addr" | grep -qiE '^0x[0-9a-f]{40}$'; then
+        echo_error "invalid address: '$addr' (expected 0x + 40 hex)"; return 1
+    fi
+    for chain in esc eid pg; do
+        mkdir -p "$SCRIPT_PATH/$chain/data"
+        echo "$addr" > "$SCRIPT_PATH/$chain/data/miner_address.txt"
+        chmod 600 "$SCRIPT_PATH/$chain/data/miner_address.txt"
+        echo_ok "$chain reward -> $addr"
+    done
+    echo "Restart the side chains to apply:  $SCRIPT_NAME esc restart   (etc.)"
+}
+
+# uninstall_cmd: stop everything and remove the install + config (destructive).
+uninstall_cmd()
+{
+    local ANSWER bk c
+    ui_red "This stops all chains and DELETES the install + config."; echo
+    echo "  removes: $SCRIPT_PATH/{ela,esc,eid,pg,*-oracle,arbiter,extern} and ~/.config/elastos"
+    echo "  the ELA keystore is backed up to ~/ first; chain DATA is gone."
+    if noninteractive; then echo_error "uninstall needs an interactive terminal - refusing to delete unattended"; return 1; fi
+    read -p "Type DELETE to confirm: " ANSWER
+    if [ "$ANSWER" != "DELETE" ]; then echo "Aborted."; return 1; fi
+    if [ -f "$SCRIPT_PATH/ela/keystore.dat" ]; then
+        bk=~/keystore.dat.bak.$(date +%s)
+        cp -p "$SCRIPT_PATH/ela/keystore.dat" "$bk" && echo_ok "keystore backed up -> $bk"
+    fi
+    all_stop 2>/dev/null
+    pkill -x ela 2>/dev/null; pkill -x arbiter 2>/dev/null
+    for c in $EVM_CHAINS; do pkill -f "^\./$c .*--rpc " 2>/dev/null; done
+    pkill -f 'node crosschain_' 2>/dev/null
+    crontab -l 2>/dev/null | grep -v 'node.sh' | crontab - 2>/dev/null
+    rm -rf "$SCRIPT_PATH"/ela "$SCRIPT_PATH"/esc "$SCRIPT_PATH"/eid "$SCRIPT_PATH"/pg \
+           "$SCRIPT_PATH"/eco "$SCRIPT_PATH"/pgp \
+           "$SCRIPT_PATH"/esc-oracle "$SCRIPT_PATH"/eid-oracle "$SCRIPT_PATH"/eco-oracle \
+           "$SCRIPT_PATH"/pgp-oracle "$SCRIPT_PATH"/pg-oracle "$SCRIPT_PATH"/arbiter \
+           "$SCRIPT_PATH"/extern "$SCRIPT_PATH"/.node-upload ~/.config/elastos
+    echo_ok "uninstalled (node.sh kept; remove with: rm $SCRIPT_PATH/$SCRIPT_NAME)"
+}
+
+# migrate_apply [--yes]: apply the hardened RPC binding with near-zero downtime.
+# Restarts ONLY stale side chains (esc/eid/pg), one at a time, verifying each comes
+# back on 127.0.0.1 before the next. The ELA mainchain is never restarted, so the
+# council producer keeps signing throughout. A single node cannot know fleet quorum -
+# coordinate across the council so only a few nodes restart a given chain at once.
+migrate_apply()
+{
+    local yes= chain pid cmd stale= ANSWER i ok
+    case "$1" in --yes|-y) yes=1 ;; esac
+
+    ui_bold "Apply hardening - staged restart of stale side chains"; echo
+    echo "  the ELA mainchain is NOT restarted; your consensus/producer stays online"
+    echo
+
+    for chain in $EVM_CHAINS; do
+        pid=$(pgrep -f "^\./$chain .*--rpc " 2>/dev/null | head -1)
+        [ -z "$pid" ] && continue
+        cmd=$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null)
+        echo "$cmd" | grep -qE -- '0[.]0[.]0[.]0|--unlock ' || { echo_ok "$chain already hardened"; continue; }
+        [ "$chain" == "eco" ] && { echo "  $(ui_yellow '!') eco is decommissioned - left untouched; remove it with:  $SCRIPT_NAME eco purge"; continue; }
+        stale="$stale $chain"
+    done
+
+    if [ -z "$stale" ]; then
+        echo "Nothing to do - no stale side chain to restart."
+        return 0
+    fi
+    echo "Will restart, one at a time:$stale"
+    if [ -z "$yes" ]; then
+        if noninteractive; then echo_error "non-interactive: re-run '$SCRIPT_NAME migrate --apply --yes'"; return 1; fi
+        read -p "Proceed (Yes/No)? " ANSWER
+        case "$ANSWER" in Yes|yes|y) ;; *) echo "Aborted."; return 1 ;; esac
+    fi
+
+    for chain in $stale; do
+        echo; echo "-- restarting $chain --"
+        chain_restart "$chain"
+        ok=
+        for i in $(seq 1 30); do
+            if chain_running "$chain"; then
+                pid=$(pgrep -f "^\./$chain .*--rpc " 2>/dev/null | head -1)
+                cmd=$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null)
+                echo "$cmd" | grep -qE -- '0[.]0[.]0[.]0|--unlock ' || { ok=1; break; }
+            fi
+            sleep 2
+        done
+        if [ -n "$ok" ]; then
+            echo_ok "$chain back up, hardened (127.0.0.1)"
+        else
+            echo_error "$chain did not come back hardened in time - check '$SCRIPT_NAME $chain status' before continuing"
+            return 1
+        fi
+    done
+
+    echo; echo_ok "all stale side chains hardened"
+    echo "Verify:  $SCRIPT_NAME summary"
+}
+
+# migrate [--dry-run]: move an existing install (an earlier version or the original Elastos.Node)
+# onto Elastos Node for Ubuntu. Preserves keystore + chaindata + config; only writes the
+# profile + a rollback snapshot; NEVER auto-restarts and NEVER deletes anything.
+migrate()
+{
+    local dryrun= src=fresh prof chain pid cmd a ts stale= need_reward=
+    case "$1" in
+        --apply)      migrate_apply "$2"; return $? ;;
+        --dry-run|-n) dryrun=1 ;;
+    esac
+
+    ui_bold "Migrate to Elastos Node for Ubuntu"; echo
+    [ -n "$dryrun" ] && { ui_dim "  dry-run: nothing will be changed"; echo; }
+    echo
+
+    # 1. detect the source install
+    if [ -f "$PROFILE_FILE" ]; then
+        src="earlier-version"
+    elif [ -d "$SCRIPT_PATH/ela" ] || [ -d "$SCRIPT_PATH/esc" ] || [ -d "$SCRIPT_PATH/eid" ] || [ -d "$SCRIPT_PATH/pg" ]; then
+        src="official-upstream"
+    fi
+    echo "Source: $src"
+    if [ "$src" == "fresh" ]; then
+        echo "  no existing install found - run '$SCRIPT_NAME setup' instead."
+        return 0
+    fi
+
+    # 2. preflight - the node identity must be safe
+    echo; echo "Preflight:"
+    if [ -d "$SCRIPT_PATH/ela" ] && [ ! -f "$SCRIPT_PATH/ela/keystore.dat" ]; then
+        echo_error "ela/keystore.dat missing - node identity at risk. ABORTING (nothing changed)."
+        return 1
+    fi
+    [ -f "$SCRIPT_PATH/ela/keystore.dat" ] && echo_ok "ela keystore present (preserved, never touched)"
+    if [ -f ~/.config/elastos/node.json ]; then
+        if jq -e . ~/.config/elastos/node.json >/dev/null 2>&1; then
+            echo_ok "node.json valid"
+        else
+            echo_error "node.json is not valid JSON - fix it before migrating"; return 1
+        fi
+    fi
+
+    # 3. profile - official upstream has none, so infer it from what is installed
+    if [ -f "$PROFILE_FILE" ]; then
+        prof=$(get_profile); echo_ok "profile: $prof (kept)"
+    else
+        if [ -d "$SCRIPT_PATH/esc" ] || [ -d "$SCRIPT_PATH/eid" ] || [ -d "$SCRIPT_PATH/pg" ]; then prof=full; else prof=mainchain; fi
+        echo "  no profile (upstream) -> inferred: $prof"
+        if [ -z "$dryrun" ]; then
+            mkdir -p "$(dirname "$PROFILE_FILE")"; echo "$prof" > "$PROFILE_FILE"; echo_ok "profile written: $prof"
+        fi
+    fi
+
+    # 4. cold-miner bridge - a mining chain with no cold address will refuse to start
+    echo; echo "Mining reward addresses:"
+    for chain in esc eid pg; do
+        { [ -d "$SCRIPT_PATH/$chain" ] && [ -f ~/.config/elastos/$chain.txt ]; } || continue
+        a=
+        [ -f "$SCRIPT_PATH/$chain/data/miner_address.txt" ] && a=$(tr -d '[:space:]' < "$SCRIPT_PATH/$chain/data/miner_address.txt" 2>/dev/null)
+        if echo "$a" | grep -qiE '^0x[0-9a-f]{40}$'; then
+            echo_ok "$chain cold reward set"
+        else
+            echo "  $(ui_yellow '!') $chain is mining but has NO cold reward address"; need_reward=1
+        fi
+    done
+    [ -n "$need_reward" ] && echo "  set it before restarting:  $SCRIPT_NAME reward set 0xYOURCOLDADDR"
+
+    # 5. which running EVM chains are still on stale (unhardened) flags
+    echo; echo "Restart plan (to apply the hardened RPC binding):"
+    for chain in $EVM_CHAINS; do
+        pid=$(pgrep -f "^\./$chain .*--rpc " 2>/dev/null | head -1)
+        [ -z "$pid" ] && continue
+        cmd=$(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null)
+        if echo "$cmd" | grep -qE -- '0[.]0[.]0[.]0|--unlock '; then
+            echo "  $(ui_yellow '!') $chain is on OLD flags (public RPC) - restart to harden"; stale="$stale $chain"
+        else
+            echo_ok "$chain already hardened (127.0.0.1)"
+        fi
+    done
+    [ -z "$stale" ] && echo "  no running EVM chain needs a restart"
+
+    # leftover decommissioned ECO install (common on upstream nodes)
+    if [ -d "$SCRIPT_PATH/eco" ] || [ -d "$SCRIPT_PATH/eco-oracle" ] || [ -f ~/.config/elastos/eco.txt ]; then
+        echo
+        echo "  $(ui_yellow '!') decommissioned ECO chain detected on this node"
+        echo "    after migrating, stop + remove it with:  $SCRIPT_NAME eco purge"
+    fi
+
+    # 6. snapshot for rollback (live edit only)
+    if [ -z "$dryrun" ]; then
+        echo; echo "Snapshot (rollback point):"
+        ts=$(date +%s).$$
+        cp -p "$SCRIPT_PATH/$SCRIPT_NAME" "$SCRIPT_PATH/$SCRIPT_NAME.bak.$ts" 2>/dev/null && echo_ok "node.sh -> $SCRIPT_NAME.bak.$ts"
+        [ -d ~/.config/elastos ] && cp -rp ~/.config/elastos ~/.config/elastos.bak.$ts 2>/dev/null && echo_ok "config -> ~/.config/elastos.bak.$ts"
+    fi
+
+    # 7. hand control to the operator - never auto-restart
+    echo
+    if [ -n "$dryrun" ]; then
+        ui_bold "DRY-RUN complete"; echo " - re-run '$SCRIPT_NAME migrate' (no flag) to write the profile + snapshot AND close the public RPC firewall ports."
+    else
+        ui_bold "Migration prepared."; echo " The script is already swapped (zero downtime); daemons are still up."
+        echo
+        echo "Closing public RPC exposure (firewall only - safe, nothing is restarted):"
+        harden_firewall
+    fi
+    if [ -n "$stale" ]; then
+        echo "Apply the hardening - restart these ONE AT A TIME, staying above quorum:"
+        for chain in $stale; do echo "    $SCRIPT_NAME $chain restart"; done
+    fi
+    echo "Check anytime:    $SCRIPT_NAME summary"
+    echo "Update later:     $SCRIPT_NAME update_script   (pulls the latest version, checksum-verified)"
+}
+
 all_start()
 {
-    ela_installed        && ela_start
-    esc_installed        && esc_start
-    esc-oracle_installed && esc-oracle_start
-    eid_installed        && eid_start
-    eid-oracle_installed && eid-oracle_start
-    eco_installed        && eco_start
-    eco-oracle_installed && eco-oracle_start
-    #pgp_installed        && pgp_start
-    #pgp-oracle_installed && pgp-oracle_start
-    pg_installed         && pg_start
-    pg-oracle_installed  && pg-oracle_start
-    arbiter_installed    && arbiter_start
+    local chain
+    for chain in $(profile_chains); do
+        "${chain}_installed" || continue
+        "${chain}_start"
+    done
+}
+
+# wait_stop <pid>: after a chain has been signalled, wait for it to exit (printing
+# dots), then escalate to SIGKILL if it is still alive after the grace period - so
+# `stop` can never hang forever on a process that ignores the signal. The grace
+# window is deliberately long: a geth side chain (esc/eid/pg) or the ela main chain
+# can take a while to flush state on shutdown, and a premature SIGKILL mid-flush can
+# corrupt chaindata. 300s matches the chains' own shutdown flush budget; a healthy
+# chain exits in seconds, so the SIGKILL only ever fires on a genuinely stuck process.
+STOP_GRACE=300
+# Stateless services (arbiter, oracles) hold no chaindata, so a SIGKILL can't corrupt
+# anything and a long wait is pointless - they get a short grace. The arbiter in
+# particular ignores SIGTERM and would otherwise burn the full chain grace on every stop.
+STOP_GRACE_SVC=20
+wait_stop()
+{
+    local pid=$1 grace=${2:-$STOP_GRACE} n=0
+    while ps -p $pid 1>/dev/null 2>&1; do
+        echo -n .
+        sleep 1
+        n=$((n + 1))
+        if [ $n -ge $grace ]; then
+            echo; echo_warn "still running after ${grace}s - sending SIGKILL"
+            kill -9 $pid 2>/dev/null
+            sleep 1
+            break
+        fi
+    done
+    echo
 }
 
 all_stop()
 {
-    arbiter_installed    && arbiter_stop
-    ela_installed        && ela_stop
-    eid-oracle_installed && eid-oracle_stop
-    eid_installed        && eid_stop
-    esc-oracle_installed && esc-oracle_stop
-    esc_installed        && esc_stop
-    eco-oracle_installed && eco-oracle_stop
-    #pgp_installed        && pgp_stop
-    #pgp-oracle_installed && pgp-oracle_stop
-    pg_installed         && pg_stop
-    pg-oracle_installed  && pg-oracle_stop
-    eco_installed        && eco_stop
+    # stop in reverse start order for a clean shutdown
+    local chain reversed=
+    for chain in $(profile_chains); do
+        reversed="$chain $reversed"
+    done
+    for chain in $reversed; do
+        "${chain}_installed" && "${chain}_stop"
+    done
 }
 
 all_status()
 {
-    ela_installed        && ela_status
-    esc_installed        && esc_status
-    esc-oracle_installed && esc-oracle_status
-    eid_installed        && eid_status
-    eid-oracle_installed && eid-oracle_status
-    eco_installed        && eco_status
-    eco-oracle_installed && eco-oracle_status
-    #pgp_installed        && pgp_status
-    #pgp-oracle_installed && pgp-oracle_status
-    pg_installed         && pg_status
-    pg-oracle_installed  && pg-oracle_status
-    arbiter_installed    && arbiter_status
+    local chain
+    for chain in $(profile_chains); do
+        "${chain}_installed" && "${chain}_status"
+    done
 }
 
 all_update()
 {
-    ela_installed        && ela_update
-    esc_installed        && esc_update
-    esc-oracle_installed && esc-oracle_update
-    eid_installed        && eid_update
-    eid-oracle_installed && eid-oracle_update
-    eco_installed        && eco_update
-    eco-oracle_installed && eco-oracle_update
-    #pgp_installed        && pgp_update
-    #pgp-oracle_installed && pgp-oracle_update
-    pg_installed         && pg_update
-    pg-oracle_installed  && pg-oracle_update
-    arbiter_installed    && arbiter_update
+    local chain
+    for chain in $(profile_chains); do
+        "${chain}_installed" && "${chain}_update"
+    done
 }
 
 all_init()
 {
-    ela_init
-    esc_init
-    esc-oracle_init
-    eid_init
-    eid-oracle_init
-    eco_init
-    eco-oracle_init
-    #pgp_init
-    #pgp-oracle_init
-    pg_init
-    pg-oracle_init
-    arbiter_init
+    profile_prompt_if_unset
+    clean_orphaned_config
+    local chain
+    for chain in $(profile_chains); do
+        "${chain}_init"
+    done
 }
-
 all_compress_log()
 {
     ela_installed        && ela_compress_log
@@ -860,10 +2176,42 @@ ela_usage()
     echo
 }
 
+# ensure_sponsors: the ELA mainchain needs a `sponsors` file (height->sponsor lookup)
+# to validate blocks past the RecordSponsor fork (~1.8M). Upstream never fetches it, so
+# fresh nodes stall with "sponsors file not exist!". Download it if missing (mainnet only).
+ensure_sponsors()
+{
+    [ "$CHAIN_TYPE" == "mainnet" ] || return 0
+    local f=$SCRIPT_PATH/ela/sponsors
+    [ -s "$f" ] && return 0
+    local pfx=https://download.elastos.io/elastos-ela ver v
+    ver=$(get_elastos_ver_latest "$pfx" 2>/dev/null)
+    echo "Fetching the ELA sponsors file (~28MB, one-time; needed past block ~1.8M)..."
+    echo "  on a slow link this can take a few minutes - safe to wait; do not interrupt."
+    for v in "$ver" v0.9.9; do
+        [ -z "$v" ] && continue
+        if curl -fsSL --connect-timeout 15 --speed-limit 1024 --speed-time 30 --max-time 600 "$pfx/elastos-ela-$v/sponsors" -o "$f.tmp" 2>/dev/null \
+           && [ -s "$f.tmp" ] && ! head -c 200 "$f.tmp" | grep -qi '<html'; then
+            mv "$f.tmp" "$f"
+            echo_ok "sponsors file installed ($v, $(wc -l < "$f") entries)"
+            return 0
+        fi
+    done
+    rm -f "$f.tmp"
+    echo_warn "could not fetch the sponsors file - the mainchain may stall past block ~1.8M"
+    echo_warn "fetch it manually:  curl -fsSL $pfx/elastos-ela-v0.9.9/sponsors -o $f"
+    return 1
+}
+
 ela_start()
 {
     if [ ! -f $SCRIPT_PATH/ela/ela ]; then
         echo_error "$SCRIPT_PATH/ela/ela is not exist"
+        return
+    fi
+
+    if [ ! -f $SCRIPT_PATH/ela/config.json ]; then
+        echo_error "ela is not initialized (no config.json) - run:  $SCRIPT_PATH/$SCRIPT_NAME ela init"
         return
     fi
 
@@ -873,6 +2221,8 @@ ela_start()
         return
     fi
 
+    ensure_sponsors
+
     echo "Starting ela..."
     cd $SCRIPT_PATH/ela
     if [ -f ~/.config/elastos/ela.txt ]; then
@@ -881,6 +2231,7 @@ ela_start()
         nohup ./ela 1>/dev/null 2>output &
     fi
     sleep 1
+    verify_started ela
     ela_status
 }
 
@@ -890,11 +2241,7 @@ ela_stop()
     if [ "$PID" != "" ]; then
         echo "Stopping ela..."
         kill $PID
-        while ps -p $PID 1>/dev/null; do
-            echo -n .
-            sleep 1
-        done
-        echo
+        wait_stop $PID
     fi
     sync
     ela_status
@@ -1071,7 +2418,7 @@ ela_status()
 
     local ELA_NUM_PEERS=$(ela_client info getconnectioncount)
     if [[ ! "$ELA_NUM_PEERS" =~ ^[0-9]+$ ]]; then
-        ELA_NUM_PEERS=0
+        ELA_NUM_PEERS=N/A
     fi
     local ELA_HEIGHT=$(ela_client info getcurrentheight)
     if [[ ! "$ELA_HEIGHT" =~ ^[0-9]+$ ]]; then
@@ -1109,10 +2456,16 @@ ela_status()
         ELA_DPOS_VOTES=N/A
     fi
 
-    local ELA_DPOS_REWARDS=$(ela_jsonrpc dposv2rewardinfo |
-        jq -r ".result[]? | select(.address == \"$ELA_ADDRESS\") | .claimable")
-    if [ "$ELA_DPOS_REWARDS" == "" ]; then
-        ELA_DPOS_REWARDS=N/A
+    # dposv2rewardinfo (all-address form) ranges a live, unlocked consensus map in
+    # the ELA daemon and panics it during sync (concurrent map iteration + write).
+    # Only query it once the node is fully synced; otherwise report N/A.
+    local ELA_DPOS_REWARDS=N/A
+    if ela_synced 2>/dev/null; then
+        ELA_DPOS_REWARDS=$(ela_jsonrpc dposv2rewardinfo |
+            jq -r ".result[]? | select(.address == \"$ELA_ADDRESS\") | .claimable")
+        if [ "$ELA_DPOS_REWARDS" == "" ]; then
+            ELA_DPOS_REWARDS=N/A
+        fi
     fi
 
     local ELA_CRC_NAME=$(ela_jsonrpc listcurrentcrs state all |
@@ -1230,24 +2583,35 @@ ela_init()
         ela_update -y
     fi
 
+    # .init is the single source of truth for "already initialized". An init that
+    # was interrupted after config.json was written but before .init was touched
+    # used to wedge the chain forever (a re-run bailed on "config exists" and .init
+    # was never created). When .init is absent we instead REPAIR, preserving any
+    # real keystore at all costs.
+    local ELA_ADOPT_KEYSTORE=
     if [ -f ${SCRIPT_PATH}/ela/.init ]; then
         echo_error "ela has already been initialized"
         return
     fi
 
-    if [ -f $ELA_CONFIG ]; then
-        echo_error "$ELA_CONFIG exists"
-        return
-    fi
-
-    if [ -f $ELA_KEYSTORE_PASS_FILE ]; then
-        echo_error "$ELA_KEYSTORE_PASS_FILE exists"
-        return
-    fi
-
     if [ -f $ELA_KEYSTORE ]; then
-        echo_error "$ELA_KEYSTORE exists"
-        return
+        # A real keystore survived an interrupted init. Adopt it: we will keep the
+        # keystore untouched, (re)generate the config below if missing, and stamp
+        # .init at the end. The runtime password file is required to use it.
+        if [ ! -f $ELA_KEYSTORE_PASS_FILE ]; then
+            echo_error "$ELA_KEYSTORE exists but its password file $ELA_KEYSTORE_PASS_FILE is missing"
+            echo_error "refusing to touch the keystore - restore the password file or back up and remove the keystore, then re-run init"
+            return
+        fi
+        echo_warn "ela keystore already present - adopting it (resuming an interrupted init; keystore left untouched)"
+        ELA_ADOPT_KEYSTORE=1
+    else
+        # No keystore. Any config/tmp/password left over from a half-finished init
+        # is useless without a keystore, so clear it and start clean.
+        if [ -f $ELA_CONFIG ] || [ -f $ELA_CONFIG.tmp ] || [ -f $ELA_KEYSTORE_PASS_FILE ]; then
+            echo_warn "clearing partial ela init (config/password with no keystore) and starting clean"
+            rm -f $ELA_CONFIG $ELA_CONFIG.tmp $ELA_KEYSTORE_PASS_FILE
+        fi
     fi
 
     if [ ! -f $ELA_CONFIG ]; then
@@ -1296,8 +2660,8 @@ EOF
         fi
 
         echo "Generating random userpass for ela RPC interface..."
-        local ELA_RPC_USER=$(openssl rand -base64 100 | shasum | head -c 32)
-        local ELA_RPC_PASS=$(openssl rand -base64 100 | shasum | head -c 32)
+        local ELA_RPC_USER=$(openssl rand -base64 100 | sha256sum | head -c 32)
+        local ELA_RPC_PASS=$(openssl rand -base64 100 | sha256sum | head -c 32)
 
         echo "Updating ela config file..."
         jq ".Configuration.RpcConfiguration.User=\"$ELA_RPC_USER\" | \
@@ -1308,25 +2672,49 @@ EOF
         fi
     fi
 
-    echo "Creating ela keystore..."
-    gen_pass
-    if [ "$KEYSTORE_PASS" == "" ]; then
-        echo_error "empty password"
-        exit
+    # A config that survived an interrupted init may still carry the placeholder RPC
+    # credentials (interruption between writing the config and the jq credential update,
+    # or a failed jq). Regenerate them so the node never runs with User/Pass = USER/PASSWORD.
+    # Placeholders are non-functional defaults, so this is always safe.
+    if [ -f $ELA_CONFIG ] && jq -e '.Configuration.RpcConfiguration.User=="USER" or .Configuration.RpcConfiguration.Pass=="PASSWORD"' $ELA_CONFIG >/dev/null 2>&1; then
+        echo_warn "ela config has placeholder RPC credentials (interrupted init) - regenerating them"
+        local ELA_RPC_USER=$(openssl rand -base64 100 | sha256sum | head -c 32)
+        local ELA_RPC_PASS=$(openssl rand -base64 100 | sha256sum | head -c 32)
+        if jq ".Configuration.RpcConfiguration.User=\"$ELA_RPC_USER\" | \
+              .Configuration.RpcConfiguration.Pass=\"$ELA_RPC_PASS\"" \
+              $ELA_CONFIG >$ELA_CONFIG.tmp && [ -s $ELA_CONFIG.tmp ]; then
+            mv $ELA_CONFIG.tmp $ELA_CONFIG
+        else
+            rm -f $ELA_CONFIG.tmp
+            echo_error "failed to regenerate ela RPC credentials - config still has placeholder USER/PASSWORD"
+        fi
     fi
-    cd ${SCRIPT_PATH}/ela/
-    ./ela-cli wallet create -p "$KEYSTORE_PASS" >/dev/null
-    if [ "$?" != "0" ]; then
-        echo_error "failed to create ela keystore"
-        return
-    fi
-    chmod 600 $ELA_KEYSTORE
 
-    echo "Saving ela keystore password..."
-    mkdir -p $(dirname $ELA_KEYSTORE_PASS_FILE)
-    chmod 700 $(dirname $ELA_KEYSTORE_PASS_FILE)
-    echo $KEYSTORE_PASS > $ELA_KEYSTORE_PASS_FILE
-    chmod 600 $ELA_KEYSTORE_PASS_FILE
+    if [ "$ELA_ADOPT_KEYSTORE" == "1" ]; then
+        echo "Adopting existing ela keystore (not regenerating)..."
+        cd ${SCRIPT_PATH}/ela/
+        KEYSTORE_PASS=$(cat $ELA_KEYSTORE_PASS_FILE)
+    else
+        echo "Creating ela keystore..."
+        gen_pass
+        if [ "$KEYSTORE_PASS" == "" ]; then
+            echo_error "empty password"
+            exit
+        fi
+        cd ${SCRIPT_PATH}/ela/
+        ./ela-cli wallet create -p "$KEYSTORE_PASS" >/dev/null
+        if [ "$?" != "0" ]; then
+            echo_error "failed to create ela keystore"
+            return
+        fi
+        chmod 600 $ELA_KEYSTORE
+
+        echo "Saving ela keystore password..."
+        mkdir -p $(dirname $ELA_KEYSTORE_PASS_FILE)
+        chmod 700 $(dirname $ELA_KEYSTORE_PASS_FILE)
+        echo $KEYSTORE_PASS > $ELA_KEYSTORE_PASS_FILE
+        chmod 600 $ELA_KEYSTORE_PASS_FILE
+    fi
 
     echo "Checking ela keystore..."
     ./ela-cli wallet account -p "$KEYSTORE_PASS"
@@ -2132,12 +3520,12 @@ esc_start()
     mkdir -p $SCRIPT_PATH/esc/logs/
 
     if [ -f ~/.config/elastos/esc.txt ]; then
+        warn_hot_miner esc
         if [ -f $SCRIPT_PATH/esc/data/miner_address.txt ]; then
             local ESC_OPTS="$ESC_OPTS --pbft.miner.address $SCRIPT_PATH/esc/data/miner_address.txt"
         fi
         nohup $SHELL -c "./esc \
             $ESC_OPTS \
-            --allow-insecure-unlock \
             --datadir $SCRIPT_PATH/esc/data \
             --mine \
             --miner.threads 1 \
@@ -2147,14 +3535,14 @@ esc_start()
             --pbft.net.address '$(extip)' \
             --pbft.net.port 20639 \
             --rpc \
-            --rpcaddr '0.0.0.0' \
+            --rpcaddr '$(evm_rpc_bind)' \
             --rpccorsdomain '*' \
-            --rpcapi 'db,eth,net,pbft,personal,txpool,web3' \
+            #--rpcapi 'db,eth,net,pbft,personal,txpool,web3' \
+            --rpcapi 'eth,net,web3,txpool,pbft' \
             --rpcvhosts '*' \
             --syncmode full \
-            --unlock '0x$(cat $SCRIPT_PATH/esc/data/keystore/UTC* | jq -r .address)' \
             --ws \
-            --wsaddr '0.0.0.0' \
+            --wsaddr '$(evm_rpc_bind)' \
             --frozen.account.list 0xD3651037F719CC3f38ef819f919972e04A0762d4 \
             --frozen.account.list 0xd5300C4091C4C45787C1BcB2b3d089F6a6094498 \
             --frozen.account.list 0xE4F50ec2E5E75d28647ce11Fd249f1Bf44be4269 \
@@ -2171,26 +3559,28 @@ esc_start()
             --maxpeers=100 \
             --cache=4096 \
             2>&1 \
-            | rotatelogs $SCRIPT_PATH/esc/logs/esc-%Y-%m-%d-%H_%M_%S.log 20M" &
+            | rotatelogs $SCRIPT_PATH/esc/logs/esc-%Y-%m-%d-%H_%M_%S.log 20M" >/dev/null 2>&1 &
     else
         nohup $SHELL -c "./esc \
             $ESC_OPTS \
             --datadir $SCRIPT_PATH/esc/data \
             --lightserv 10 \
             --rpc \
-            --rpcaddr '0.0.0.0' \
+            --rpcaddr '$(evm_rpc_bind)' \
             --rpccorsdomain '*' \
-            --rpcapi 'admin,db,eth,net,pbft,personal,txpool,web3' \
+            #--rpcapi 'admin,db,eth,net,pbft,personal,txpool,web3' \
+            --rpcapi 'eth,net,web3,txpool' \
             --rpcvhosts '*' \
             --ws \
-            --wsaddr '0.0.0.0' \
+            --wsaddr '$(evm_rpc_bind)' \
             --wsorigins '*' \
             --wsapi 'web3, eth' \
             2>&1 \
-            | rotatelogs $SCRIPT_PATH/esc/logs/esc-%Y-%m-%d-%H_%M_%S.log 20M" &
+            | rotatelogs $SCRIPT_PATH/esc/logs/esc-%Y-%m-%d-%H_%M_%S.log 20M" >/dev/null 2>&1 &
     fi
 
     sleep 3
+    verify_started esc
     esc_status
 }
 
@@ -2221,12 +3611,12 @@ eco_start()
     mkdir -p $SCRIPT_PATH/eco/logs/
 
     if [ -f ~/.config/elastos/eco.txt ]; then
+        warn_hot_miner eco
         if [ -f $SCRIPT_PATH/eco/data/miner_address.txt ]; then
             local ECO_OPTS="$ECO_OPTS --pbft.miner.address $SCRIPT_PATH/eco/data/miner_address.txt"
         fi
         nohup $SHELL -c "./eco \
             $ECO_OPTS \
-            --allow-insecure-unlock \
             --datadir $SCRIPT_PATH/eco/data \
             --mine \
             --miner.threads 1 \
@@ -2236,33 +3626,33 @@ eco_start()
             --pbft.net.address '$(extip)' \
             --pbft.net.port 20659 \
             --rpc \
-            --rpcaddr '0.0.0.0' \
-            --rpcapi 'db,eth,net,pbft,personal,txpool,web3' \
+            --rpcaddr '$(evm_rpc_bind)' \
+            --rpcapi 'eth,net,web3,txpool,pbft' \
             --rpcvhosts '*' \
             --syncmode full \
-            --unlock '0x$(cat $SCRIPT_PATH/eco/data/keystore/UTC* | jq -r .address)' \
             --ws \
-            --wsaddr '0.0.0.0' \
+            --wsaddr '$(evm_rpc_bind)' \
             --wsorigins '*' \
             2>&1 \
-            | rotatelogs $SCRIPT_PATH/eco/logs/eco-%Y-%m-%d-%H_%M_%S.log 20M" &
+            | rotatelogs $SCRIPT_PATH/eco/logs/eco-%Y-%m-%d-%H_%M_%S.log 20M" >/dev/null 2>&1 &
     else
         nohup $SHELL -c "./eco \
             $ECO_OPTS \
             --datadir $SCRIPT_PATH/eco/data \
             --lightserv 10 \
             --rpc \
-            --rpcaddr '0.0.0.0' \
-            --rpcapi 'admin,eth,net,txpool,web3' \
+            --rpcaddr '$(evm_rpc_bind)' \
+            --rpcapi 'eth,net,web3,txpool' \
             --rpcvhosts '*' \
             --ws \
-            --wsaddr '0.0.0.0' \
+            --wsaddr '$(evm_rpc_bind)' \
             --wsorigins '*' \
             2>&1 \
-            | rotatelogs $SCRIPT_PATH/eco/logs/eco-%Y-%m-%d-%H_%M_%S.log 20M" &
+            | rotatelogs $SCRIPT_PATH/eco/logs/eco-%Y-%m-%d-%H_%M_%S.log 20M" >/dev/null 2>&1 &
     fi
 
     sleep 3
+    verify_started eco
     eco_status
 }
 
@@ -2293,12 +3683,12 @@ pgp_start()
     mkdir -p $SCRIPT_PATH/pgp/logs/
 
     if [ -f ~/.config/elastos/pgp.txt ]; then
+        warn_hot_miner pgp
         if [ -f $SCRIPT_PATH/pgp/data/miner_address.txt ]; then
             local PGP_OPTS="$PGP_OPTS --pbft.miner.address $SCRIPT_PATH/pgp/data/miner_address.txt"
         fi
         nohup $SHELL -c "./pgp \
             $PGP_OPTS \
-            --allow-insecure-unlock \
             --datadir $SCRIPT_PATH/pgp/data \
             --mine \
             --miner.threads 1 \
@@ -2308,33 +3698,33 @@ pgp_start()
             --pbft.net.address '$(extip)' \
             --pbft.net.port 20669 \
             --rpc \
-            --rpcaddr '0.0.0.0' \
-            --rpcapi 'db,eth,net,pbft,personal,txpool,web3' \
+            --rpcaddr '$(evm_rpc_bind)' \
+            --rpcapi 'eth,net,web3,txpool,pbft' \
             --rpcvhosts '*' \
             --syncmode full \
-            --unlock '0x$(cat $SCRIPT_PATH/pgp/data/keystore/UTC* | jq -r .address)' \
             --ws \
-            --wsaddr '0.0.0.0' \
+            --wsaddr '$(evm_rpc_bind)' \
             --wsorigins '*' \
             2>&1 \
-            | rotatelogs $SCRIPT_PATH/pgp/logs/pgp-%Y-%m-%d-%H_%M_%S.log 20M" &
+            | rotatelogs $SCRIPT_PATH/pgp/logs/pgp-%Y-%m-%d-%H_%M_%S.log 20M" >/dev/null 2>&1 &
     else
         nohup $SHELL -c "./pgp \
             $PGP_OPTS \
             --datadir $SCRIPT_PATH/pgp/data \
             --lightserv 10 \
             --rpc \
-            --rpcaddr '0.0.0.0' \
-            --rpcapi 'admin,eth,net,txpool,web3' \
+            --rpcaddr '$(evm_rpc_bind)' \
+            --rpcapi 'eth,net,web3,txpool' \
             --rpcvhosts '*' \
             --ws \
-            --wsaddr '0.0.0.0' \
+            --wsaddr '$(evm_rpc_bind)' \
             --wsorigins '*' \
             2>&1 \
-            | rotatelogs $SCRIPT_PATH/pgp/logs/pgp-%Y-%m-%d-%H_%M_%S.log 20M" &
+            | rotatelogs $SCRIPT_PATH/pgp/logs/pgp-%Y-%m-%d-%H_%M_%S.log 20M" >/dev/null 2>&1 &
     fi
 
     sleep 3
+    verify_started pgp
     pgp_status
 }
 
@@ -2366,12 +3756,12 @@ pg_start()
     mkdir -p $SCRIPT_PATH/pg/logs/
 
     if [ -f ~/.config/elastos/pg.txt ]; then
+        warn_hot_miner pg
         if [ -f $SCRIPT_PATH/pg/data/miner_address.txt ]; then
             local PG_OPTS="$PG_OPTS --pbft.miner.address $SCRIPT_PATH/pg/data/miner_address.txt"
         fi
         nohup $SHELL -c "./pg \
             $PG_OPTS \
-            --allow-insecure-unlock \
             --datadir $SCRIPT_PATH/pg/data \
             --mine \
             --miner.threads 1 \
@@ -2381,33 +3771,33 @@ pg_start()
             --pbft.net.address '$(extip)' \
             --pbft.net.port 20679 \
             --rpc \
-            --rpcaddr '0.0.0.0' \
-            --rpcapi 'db,eth,net,pbft,personal,txpool,web3' \
+            --rpcaddr '$(evm_rpc_bind)' \
+            --rpcapi 'eth,net,web3,txpool,pbft' \
             --rpcvhosts '*' \
             --syncmode full \
-            --unlock '0x$(cat $SCRIPT_PATH/pg/data/keystore/UTC* | jq -r .address)' \
             --ws \
-            --wsaddr '0.0.0.0' \
+            --wsaddr '$(evm_rpc_bind)' \
             --wsorigins '*' \
             2>&1 \
-            | rotatelogs $SCRIPT_PATH/pg/logs/pg-%Y-%m-%d-%H_%M_%S.log 20M" &
+            | rotatelogs $SCRIPT_PATH/pg/logs/pg-%Y-%m-%d-%H_%M_%S.log 20M" >/dev/null 2>&1 &
     else
         nohup $SHELL -c "./pg \
             $PG_OPTS \
             --datadir $SCRIPT_PATH/pg/data \
             --lightserv 10 \
             --rpc \
-            --rpcaddr '0.0.0.0' \
-            --rpcapi 'admin,eth,net,txpool,web3' \
+            --rpcaddr '$(evm_rpc_bind)' \
+            --rpcapi 'eth,net,web3,txpool' \
             --rpcvhosts '*' \
             --ws \
-            --wsaddr '0.0.0.0' \
+            --wsaddr '$(evm_rpc_bind)' \
             --wsorigins '*' \
             2>&1 \
-            | rotatelogs $SCRIPT_PATH/pg/logs/pg-%Y-%m-%d-%H_%M_%S.log 20M" &
+            | rotatelogs $SCRIPT_PATH/pg/logs/pg-%Y-%m-%d-%H_%M_%S.log 20M" >/dev/null 2>&1 &
     fi
 
     sleep 3
+    verify_started pg
     pg_status
 }
 
@@ -2417,11 +3807,7 @@ esc_stop()
     if [ "$PID" != "" ]; then
         echo "Stopping esc..."
         kill -s SIGINT $PID
-        while ps -p $PID 1>/dev/null; do
-            echo -n .
-            sleep 1
-        done
-        echo
+        wait_stop $PID
     fi
     sync
     esc_status
@@ -2432,11 +3818,7 @@ eco_stop()
     if [ "$PID" != "" ]; then
         echo "Stopping eco..."
         kill -s SIGINT $PID
-        while ps -p $PID 1>/dev/null; do
-            echo -n .
-            sleep 1
-        done
-        echo
+        wait_stop $PID
     fi
     sync
     eco_status
@@ -2448,11 +3830,7 @@ pgp_stop()
     if [ "$PID" != "" ]; then
         echo "Stopping pgp..."
         kill -s SIGINT $PID
-        while ps -p $PID 1>/dev/null; do
-            echo -n .
-            sleep 1
-        done
-        echo
+        wait_stop $PID
     fi
     sync
     pgp_status
@@ -2464,11 +3842,7 @@ pg_stop()
     if [ "$PID" != "" ]; then
         echo "Stopping pg..."
         kill -s SIGINT $PID
-        while ps -p $PID 1>/dev/null; do
-            echo -n .
-            sleep 1
-        done
-        echo
+        wait_stop $PID
     fi
     sync
     pg_status
@@ -2725,20 +4099,20 @@ esc_status()
     local ESC_NUM_PEERS=$(esc_jsonrpc \
         '{"jsonrpc":"2.0","method":"net_peerCount","params":[],"id":1}' \
         | jq -r '.result')
-    ESC_NUM_PEERS=$(($ESC_NUM_PEERS))
+    ESC_NUM_PEERS=$(hex_to_dec "$ESC_NUM_PEERS")
     if [[ ! "$ESC_NUM_PEERS" =~ ^[0-9]+$ ]]; then
-        ESC_NUM_PEERS=0
+        ESC_NUM_PEERS=N/A
     fi
     local ESC_HEIGHT=$(esc_jsonrpc \
         '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
         | jq -r '.result')
-    ESC_HEIGHT=$(($ESC_HEIGHT))
+    ESC_HEIGHT=$(hex_to_dec "$ESC_HEIGHT")
     if [[ ! "$ESC_HEIGHT" =~ ^[0-9]+$ ]]; then
         ESC_HEIGHT=N/A
     fi
 
     local ESC_BALANCE=$(esc_client \
-        attach --exec "web3.fromWei(eth.getBalance('$ESC_ADDRESS'),'ether')")
+        attach --exec "web3.fromWei(eth.getBalance('$ESC_ADDRESS'),'ether')" 2>/dev/null)
     if [ "$ESC_BALANCE" == "" ]; then
         ESC_BALANCE=N/A
     elif [[ $ESC_BALANCE =~ [^.0-9e-] ]]; then
@@ -2805,20 +4179,20 @@ eco_status()
     local ECO_NUM_PEERS=$(eco_jsonrpc \
         '{"jsonrpc":"2.0","method":"net_peerCount","params":[],"id":1}' \
         | jq -r '.result')
-    ECO_NUM_PEERS=$(($ECO_NUM_PEERS))
+    ECO_NUM_PEERS=$(hex_to_dec "$ECO_NUM_PEERS")
     if [[ ! "$ECO_NUM_PEERS" =~ ^[0-9]+$ ]]; then
-        ECO_NUM_PEERS=0
+        ECO_NUM_PEERS=N/A
     fi
     local ECO_HEIGHT=$(eco_jsonrpc \
         '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
         | jq -r '.result')
-    ECO_HEIGHT=$(($ECO_HEIGHT))
+    ECO_HEIGHT=$(hex_to_dec "$ECO_HEIGHT")
     if [[ ! "$ECO_HEIGHT" =~ ^[0-9]+$ ]]; then
         ECO_HEIGHT=N/A
     fi
 
     local ECO_BALANCE=$(eco_client \
-        attach --exec "web3.fromWei(eth.getBalance('$ECO_ADDRESS'),'ether')")
+        attach --exec "web3.fromWei(eth.getBalance('$ECO_ADDRESS'),'ether')" 2>/dev/null)
     if [ "$ECO_BALANCE" == "" ]; then
         ECO_BALANCE=N/A
     elif [[ $ECO_BALANCE =~ [^.0-9e-] ]]; then
@@ -2886,20 +4260,20 @@ pgp_status()
     local PGP_NUM_PEERS=$(pgp_jsonrpc \
         '{"jsonrpc":"2.0","method":"net_peerCount","params":[],"id":1}' \
         | jq -r '.result')
-    PGP_NUM_PEERS=$(($PGP_NUM_PEERS))
+    PGP_NUM_PEERS=$(hex_to_dec "$PGP_NUM_PEERS")
     if [[ ! "$PGP_NUM_PEERS" =~ ^[0-9]+$ ]]; then
-        PGP_NUM_PEERS=0
+        PGP_NUM_PEERS=N/A
     fi
     local PGP_HEIGHT=$(pgp_jsonrpc \
         '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
         | jq -r '.result')
-    PGP_HEIGHT=$(($PGP_HEIGHT))
+    PGP_HEIGHT=$(hex_to_dec "$PGP_HEIGHT")
     if [[ ! "$PGP_HEIGHT" =~ ^[0-9]+$ ]]; then
         PGP_HEIGHT=N/A
     fi
 
     local PGP_BALANCE=$(pgp_client \
-        attach --exec "web3.fromWei(eth.getBalance('$PGP_ADDRESS'),'ether')")
+        attach --exec "web3.fromWei(eth.getBalance('$PGP_ADDRESS'),'ether')" 2>/dev/null)
     if [ "$PGP_BALANCE" == "" ]; then
         PGP_BALANCE=N/A
     elif [[ $PGP_BALANCE =~ [^.0-9e-] ]]; then
@@ -2966,20 +4340,20 @@ pg_status()
     local PG_NUM_PEERS=$(pg_jsonrpc \
         '{"jsonrpc":"2.0","method":"net_peerCount","params":[],"id":1}' \
         | jq -r '.result')
-    PG_NUM_PEERS=$(($PG_NUM_PEERS))
+    PG_NUM_PEERS=$(hex_to_dec "$PG_NUM_PEERS")
     if [[ ! "$PG_NUM_PEERS" =~ ^[0-9]+$ ]]; then
-        PG_NUM_PEERS=0
+        PG_NUM_PEERS=N/A
     fi
     local PG_HEIGHT=$(pg_jsonrpc \
         '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
         | jq -r '.result')
-    PG_HEIGHT=$(($PG_HEIGHT))
+    PG_HEIGHT=$(hex_to_dec "$PG_HEIGHT")
     if [[ ! "$PG_HEIGHT" =~ ^[0-9]+$ ]]; then
         PG_HEIGHT=N/A
     fi
 
     local PG_BALANCE=$(pg_client \
-        attach --exec "web3.fromWei(eth.getBalance('$PG_ADDRESS'),'ether')")
+        attach --exec "web3.fromWei(eth.getBalance('$PG_ADDRESS'),'ether')" 2>/dev/null)
     if [ "$PG_BALANCE" == "" ]; then
         PG_BALANCE=N/A
     elif [[ $PG_BALANCE =~ [^.0-9e-] ]]; then
@@ -3097,6 +4471,64 @@ esc_update()
     fi
 }
 
+# eco_purge: the ECO side chain is decommissioned network-wide. Stop eco + eco-oracle
+# and DELETE their data - only when ECO actually exists on this node. The eco keystore
+# and its password file are backed up to a tarball first.
+eco_purge()
+{
+    local found= ans ts bk note_tgt=
+    [ -d $SCRIPT_PATH/eco ] && found=1
+    [ -d $SCRIPT_PATH/eco-oracle ] && found=1
+    [ -f ~/.config/elastos/eco.txt ] && found=1
+    pgrep -f '^\./eco .*--rpc ' 1>/dev/null 2>&1 && found=1
+    pgrep -fx 'node crosschain_eco.js' 1>/dev/null 2>&1 && found=1
+    if [ -z "$found" ]; then
+        echo "eco is not installed on this node - nothing to remove."
+        return 0
+    fi
+
+    ui_bold "Remove the decommissioned ECO side chain"; echo
+    echo "  This will stop eco + eco-oracle and DELETE:"
+    [ -d $SCRIPT_PATH/eco ]          && echo "    $SCRIPT_PATH/eco  ($(du -sh $SCRIPT_PATH/eco 2>/dev/null | cut -f1))"
+    [ -d $SCRIPT_PATH/eco-oracle ]   && echo "    $SCRIPT_PATH/eco-oracle"
+    [ -f ~/.config/elastos/eco.txt ] && echo "    ~/.config/elastos/eco.txt"
+    echo "  The eco keystore + password file are backed up first."
+    echo
+    if [ "$1" != "--yes" ] && [ "$1" != "-y" ]; then
+        if noninteractive; then echo_error "refusing to delete unattended - re-run '$SCRIPT_NAME eco purge --yes'"; return 1; fi
+        read -p "Type 'eco' to confirm deletion: " ans
+        [ "$ans" == "eco" ] || { echo "Aborted - nothing changed."; return 1; }
+    fi
+
+    eco_stop 2>/dev/null
+    eco-oracle_stop 2>/dev/null
+
+    ts=$(date '+%F-%H%M%S')
+    bk=~/eco-keystore-backup-$ts.tar.gz
+    if [ -d $SCRIPT_PATH/eco/data/keystore ] || [ -f ~/.config/elastos/eco.txt ]; then
+        if ! tar -czf "$bk" \
+            $( [ -d $SCRIPT_PATH/eco/data/keystore ] && echo "$SCRIPT_PATH/eco/data/keystore" ) \
+            $( [ -f ~/.config/elastos/eco.txt ] && echo "$HOME/.config/elastos/eco.txt" ) 2>/dev/null; then
+            echo_error "keystore backup failed - NOT deleting anything"
+            rm -f "$bk"
+            return 1
+        fi
+        chmod 600 "$bk"
+        echo_ok "keystore backed up: $bk"
+    fi
+
+    # if the data dir was relocated via a symlink, deleting eco/ leaves the target behind
+    if [ -L $SCRIPT_PATH/eco/data ]; then
+        note_tgt=$(readlink "$SCRIPT_PATH/eco/data" 2>/dev/null)
+    fi
+
+    rm -rf $SCRIPT_PATH/eco $SCRIPT_PATH/eco-oracle
+    rm -f ~/.config/elastos/eco.txt
+    echo_ok "eco + eco-oracle removed"
+    [ -n "$note_tgt" ] && echo "  note: eco/data was a symlink to $note_tgt - remove that directory manually to reclaim the space"
+    return 0
+}
+
 eco_update()
 {
     unset OPTIND
@@ -3203,6 +4635,44 @@ pg_update()
 }
 
 
+# evm_verify_keystore_pass <binary> <datadir> <passfile>: best-effort check that the saved
+# password unlocks the adopted keystore. Returns:
+#   0  verified - the password decrypts the keystore
+#   1  WRONG    - geth reported it could not decrypt the key with this password
+#   2  UNKNOWN  - could not run the check (no keystore/address, mktemp/cp failed, or geth failed
+#                 without a decrypt error); the caller warns and continues - it never blocks
+# ela_init verifies its keystore before stamping .init; the EVM chains do the same so a resumed
+# init never stamps .init on a keystore the saved password no longer opens (a silently
+# non-signing node). geth has no read-only "verify password", so we run `account update` -
+# which must DECRYPT the key to proceed - against a THROWAWAY COPY of the keystore (the real
+# keystore is never modified). account update prompts for unlock + new + confirm; we over-feed
+# the same password so a differing prompt count can never starve stdin, and we judge a failure
+# by geth's own "could not decrypt" message rather than the exit code alone - so only a
+# genuinely wrong password blocks init, while a tooling hiccup degrades to a warning.
+evm_verify_keystore_pass()
+{
+    local bin=$1 datadir=$2 passfile=$3 addr pass tmp rc
+    pass=$(cat "$passfile" 2>/dev/null)
+    [ -n "$pass" ] || return 2
+    addr=$("$bin" --datadir "$datadir" --nousb --verbosity 0 account list 2>/dev/null \
+        | head -1 | sed 's/.*{\(.*\)}.*/\1/')
+    [ -n "$addr" ] || return 2
+    tmp=$(mktemp -d) || return 2
+    mkdir -p "$tmp/keystore"
+    cp "$datadir"/keystore/* "$tmp/keystore/" 2>/dev/null || { rm -rf "$tmp"; return 2; }
+    yes "$pass" | head -n 8 \
+        | "$bin" --datadir "$tmp" --nousb --verbosity 0 account update "$addr" >"$tmp/out" 2>&1
+    rc=${PIPESTATUS[2]}
+    if [ "$rc" == "0" ]; then
+        rm -rf "$tmp"; return 0
+    fi
+    if grep -qiE 'could not decrypt|wrong (pass|password)|invalid pass' "$tmp/out"; then
+        rm -rf "$tmp"; return 1
+    fi
+    rm -rf "$tmp"; return 2
+}
+
+
 esc_init()
 {
     if [ $(mem_free) -lt 512 ]; then
@@ -3222,44 +4692,66 @@ esc_init()
         return
     fi
 
+    # Resume support: .init is the single "initialized" marker. An interrupted init may
+    # have created the geth account (and esc.txt) but never reached .init. When the
+    # account already exists we ADOPT it (keystore left untouched); otherwise we clear a
+    # keystore-less leftover password file and create fresh.
     cd $SCRIPT_PATH/esc
     local ESC_NUM_ACCOUNTS=$(./esc --datadir "$SCRIPT_PATH/esc/data/" \
         --nousb --verbosity 0 account list | wc -l)
+    local ESC_ADOPT=
     if [ $ESC_NUM_ACCOUNTS -ge 1 ]; then
-        echo_error "esc keystore file exist"
-        return
+        if [ ! -f "$ESC_KEYSTORE_PASS_FILE" ]; then
+            echo_error "esc keystore exists but its password file $ESC_KEYSTORE_PASS_FILE is missing"
+            echo_error "refusing to touch the keystore - restore the password file or back up esc/data/keystore and re-run init"
+            return
+        fi
+        echo_warn "esc keystore already present - adopting it (resuming an interrupted init; keystore left untouched)"
+        ESC_ADOPT=1
+    elif [ -f "$ESC_KEYSTORE_PASS_FILE" ]; then
+        echo_warn "clearing partial esc init (password file with no keystore) and starting clean"
+        rm -f "$ESC_KEYSTORE_PASS_FILE"
     fi
 
-    if [ -f "$ESC_KEYSTORE_PASS_FILE" ]; then
-        echo_error "$ESC_KEYSTORE_PASS_FILE exist"
-        return
-    fi
+    if [ -z "$ESC_ADOPT" ]; then
+        echo "Creating esc keystore..."
+        gen_pass
+        if [ "$KEYSTORE_PASS" == "" ]; then
+            echo_error "empty password"
+            exit
+        fi
 
-    echo "Creating esc keystore..."
-    gen_pass
-    if [ "$KEYSTORE_PASS" == "" ]; then
-        echo_error "empty password"
-        exit
-    fi
+        echo "Saving esc keystore password..."
+        mkdir -p $(dirname $ESC_KEYSTORE_PASS_FILE)
+        chmod 700 $(dirname $ESC_KEYSTORE_PASS_FILE)
+        echo $KEYSTORE_PASS > $ESC_KEYSTORE_PASS_FILE
+        chmod 600 $ESC_KEYSTORE_PASS_FILE
 
-    echo "Saving esc keystore password..."
-    mkdir -p $(dirname $ESC_KEYSTORE_PASS_FILE)
-    chmod 700 $(dirname $ESC_KEYSTORE_PASS_FILE)
-    echo $KEYSTORE_PASS > $ESC_KEYSTORE_PASS_FILE
-    chmod 600 $ESC_KEYSTORE_PASS_FILE
-
-    cd ${SCRIPT_PATH}/esc
-    ./esc --datadir "$SCRIPT_PATH/esc/data/" --verbosity 0 account new \
-        --password "$ESC_KEYSTORE_PASS_FILE" >/dev/null
-    if [ "$?" != "0" ]; then
-        echo_error "failed to create esc keystore"
-        return
+        cd ${SCRIPT_PATH}/esc
+        ./esc --datadir "$SCRIPT_PATH/esc/data/" --verbosity 0 account new \
+            --password "$ESC_KEYSTORE_PASS_FILE" >/dev/null
+        if [ "$?" != "0" ]; then
+            echo_error "failed to create esc keystore"
+            return
+        fi
     fi
 
     echo "Checking esc keystore..."
     local ESC_KEYSTORE=$(./esc --datadir "$SCRIPT_PATH/esc/data/" \
         --nousb --verbosity 0 account list | sed 's/.*keystore:\/\///')
     chmod 600 $ESC_KEYSTORE
+
+    if [ -n "$ESC_ADOPT" ]; then
+        echo "Verifying esc keystore password..."
+        evm_verify_keystore_pass "$SCRIPT_PATH/esc/esc" "$SCRIPT_PATH/esc/data" "$ESC_KEYSTORE_PASS_FILE"
+        case $? in
+            0) echo_ok "esc keystore password verified" ;;
+            1) echo_error "the esc password file does not unlock the existing keystore"
+               echo_error "restore the matching password file, or back up + remove esc/data/keystore and re-run init - NOT stamping .init"
+               return ;;
+            *) echo_warn "could not verify the esc keystore password (best-effort check) - continuing; esc reports any real unlock failure at start" ;;
+        esac
+    fi
 
     local ESC_MINER_ADDRESS_FILE=$SCRIPT_PATH/esc/data/miner_address.txt
     echo "You can input an alternative esc reward address. (ENTER to skip)"
@@ -3458,44 +4950,66 @@ pg_init()
         return
     fi
 
+    # Resume support: .init is the single "initialized" marker. An interrupted init may
+    # have created the geth account (and pg.txt) but never reached .init. When the
+    # account already exists we ADOPT it (keystore left untouched); otherwise we clear a
+    # keystore-less leftover password file and create fresh.
     cd $SCRIPT_PATH/pg
     local PG_NUM_ACCOUNTS=$(./pg --datadir "$SCRIPT_PATH/pg/data/" \
         --nousb --verbosity 0 account list | wc -l)
+    local PG_ADOPT=
     if [ $PG_NUM_ACCOUNTS -ge 1 ]; then
-        echo_error "pg keystore file exist"
-        return
+        if [ ! -f "$PG_KEYSTORE_PASS_FILE" ]; then
+            echo_error "pg keystore exists but its password file $PG_KEYSTORE_PASS_FILE is missing"
+            echo_error "refusing to touch the keystore - restore the password file or back up pg/data/keystore and re-run init"
+            return
+        fi
+        echo_warn "pg keystore already present - adopting it (resuming an interrupted init; keystore left untouched)"
+        PG_ADOPT=1
+    elif [ -f "$PG_KEYSTORE_PASS_FILE" ]; then
+        echo_warn "clearing partial pg init (password file with no keystore) and starting clean"
+        rm -f "$PG_KEYSTORE_PASS_FILE"
     fi
 
-    if [ -f "$PG_KEYSTORE_PASS_FILE" ]; then
-        echo_error "$PG_KEYSTORE_PASS_FILE exist"
-        return
-    fi
+    if [ -z "$PG_ADOPT" ]; then
+        echo "Creating pg keystore..."
+        gen_pass
+        if [ "$KEYSTORE_PASS" == "" ]; then
+            echo_error "empty password"
+            exit
+        fi
 
-    echo "Creating pg keystore..."
-    gen_pass
-    if [ "$KEYSTORE_PASS" == "" ]; then
-        echo_error "empty password"
-        exit
-    fi
+        echo "Saving pg keystore password..."
+        mkdir -p $(dirname $PG_KEYSTORE_PASS_FILE)
+        chmod 700 $(dirname $PG_KEYSTORE_PASS_FILE)
+        echo $KEYSTORE_PASS > $PG_KEYSTORE_PASS_FILE
+        chmod 600 $PG_KEYSTORE_PASS_FILE
 
-    echo "Saving pg keystore password..."
-    mkdir -p $(dirname $PG_KEYSTORE_PASS_FILE)
-    chmod 700 $(dirname $PG_KEYSTORE_PASS_FILE)
-    echo $KEYSTORE_PASS > $PG_KEYSTORE_PASS_FILE
-    chmod 600 $PG_KEYSTORE_PASS_FILE
-
-    cd ${SCRIPT_PATH}/pg
-    ./pg --datadir "$SCRIPT_PATH/pg/data/" --verbosity 0 account new \
-        --password "$PG_KEYSTORE_PASS_FILE" >/dev/null
-    if [ "$?" != "0" ]; then
-        echo_error "failed to create pg keystore"
-        return
+        cd ${SCRIPT_PATH}/pg
+        ./pg --datadir "$SCRIPT_PATH/pg/data/" --verbosity 0 account new \
+            --password "$PG_KEYSTORE_PASS_FILE" >/dev/null
+        if [ "$?" != "0" ]; then
+            echo_error "failed to create pg keystore"
+            return
+        fi
     fi
 
     echo "Checking pg keystore..."
     local PG_KEYSTORE=$(./pg --datadir "$SCRIPT_PATH/pg/data/" \
         --nousb --verbosity 0 account list | sed 's/.*keystore:\/\///')
     chmod 600 $PG_KEYSTORE
+
+    if [ -n "$PG_ADOPT" ]; then
+        echo "Verifying pg keystore password..."
+        evm_verify_keystore_pass "$SCRIPT_PATH/pg/pg" "$SCRIPT_PATH/pg/data" "$PG_KEYSTORE_PASS_FILE"
+        case $? in
+            0) echo_ok "pg keystore password verified" ;;
+            1) echo_error "the pg password file does not unlock the existing keystore"
+               echo_error "restore the matching password file, or back up + remove pg/data/keystore and re-run init - NOT stamping .init"
+               return ;;
+            *) echo_warn "could not verify the pg keystore password (best-effort check) - continuing; pg reports any real unlock failure at start" ;;
+        esac
+    fi
 
     local PG_MINER_ADDRESS_FILE=$SCRIPT_PATH/pg/data/miner_address.txt
     echo "You can input an alternative pg reward address. (ENTER to skip)"
@@ -3608,9 +5122,10 @@ esc-oracle_start()
     nodejs_setenv
     nohup $SHELL -c "node crosschain_oracle.js \
         2>$SCRIPT_PATH/esc-oracle/logs/esc-oracle_err.log \
-        | rotatelogs $SCRIPT_PATH/esc-oracle/logs/esc-oracle_out-%Y-%m-%d-%H_%M_%S.log 20M" &
+        | rotatelogs $SCRIPT_PATH/esc-oracle/logs/esc-oracle_out-%Y-%m-%d-%H_%M_%S.log 20M" >/dev/null 2>&1 &
 
     sleep 1
+    verify_started esc-oracle
     esc-oracle_status
 }
 
@@ -3644,9 +5159,10 @@ eco-oracle_start()
     nodejs_setenv
     nohup $SHELL -c "node crosschain_eco.js \
         2>$SCRIPT_PATH/eco-oracle/logs/eco-oracle_err.log \
-        | rotatelogs $SCRIPT_PATH/eco-oracle/logs/eco-oracle_out-%Y-%m-%d-%H_%M_%S.log 20M" &
+        | rotatelogs $SCRIPT_PATH/eco-oracle/logs/eco-oracle_out-%Y-%m-%d-%H_%M_%S.log 20M" >/dev/null 2>&1 &
 
     sleep 1
+    verify_started eco-oracle
     eco-oracle_status
 }
 
@@ -3680,9 +5196,10 @@ pgp-oracle_start()
     nodejs_setenv
     nohup $SHELL -c "node crosschain_pgp.js \
         2>$SCRIPT_PATH/pgp-oracle/logs/pgp-oracle_err.log \
-        | rotatelogs $SCRIPT_PATH/pgp-oracle/logs/pgp-oracle_out-%Y-%m-%d-%H_%M_%S.log 20M" &
+        | rotatelogs $SCRIPT_PATH/pgp-oracle/logs/pgp-oracle_out-%Y-%m-%d-%H_%M_%S.log 20M" >/dev/null 2>&1 &
 
     sleep 1
+    verify_started pgp-oracle
     pgp-oracle_status
 }
 
@@ -3716,9 +5233,10 @@ pg-oracle_start()
     nodejs_setenv
     nohup $SHELL -c "node crosschain_pg.js \
         2>$SCRIPT_PATH/pg-oracle/logs/pg-oracle_err.log \
-        | rotatelogs $SCRIPT_PATH/pg-oracle/logs/pg-oracle_out-%Y-%m-%d-%H_%M_%S.log 20M" &
+        | rotatelogs $SCRIPT_PATH/pg-oracle/logs/pg-oracle_out-%Y-%m-%d-%H_%M_%S.log 20M" >/dev/null 2>&1 &
 
     sleep 1
+    verify_started pg-oracle
     pg-oracle_status
 }
 
@@ -3728,11 +5246,7 @@ esc-oracle_stop()
     if [ "$PID" != "" ]; then
         echo "Stopping esc-oracle..."
         kill $PID
-        while ps -p $PID 1>/dev/null; do
-            echo -n .
-            sleep 1
-        done
-        echo
+        wait_stop $PID $STOP_GRACE_SVC
     fi
     esc-oracle_status
 }
@@ -3743,11 +5257,7 @@ eco-oracle_stop()
     if [ "$PID" != "" ]; then
         echo "Stopping eco-oracle..."
         kill $PID
-        while ps -p $PID 1>/dev/null; do
-            echo -n .
-            sleep 1
-        done
-        echo
+        wait_stop $PID $STOP_GRACE_SVC
     fi
     eco-oracle_status
 }
@@ -3758,11 +5268,7 @@ pgp-oracle_stop()
     if [ "$PID" != "" ]; then
         echo "Stopping pgp-oracle..."
         kill $PID
-        while ps -p $PID 1>/dev/null; do
-            echo -n .
-            sleep 1
-        done
-        echo
+        wait_stop $PID $STOP_GRACE_SVC
     fi
     pgp-oracle_status
 }
@@ -3773,11 +5279,7 @@ pg-oracle_stop()
     if [ "$PID" != "" ]; then
         echo "Stopping pg-oracle..."
         kill $PID
-        while ps -p $PID 1>/dev/null; do
-            echo -n .
-            sleep 1
-        done
-        echo
+        wait_stop $PID $STOP_GRACE_SVC
     fi
     pg-oracle_status
 }
@@ -3821,7 +5323,7 @@ pg-oracle_installed()
 esc-oracle_ver()
 {
     if [ -f $SCRIPT_PATH/esc-oracle/crosschain_oracle.js ]; then
-        echo "esc-oracle $(cat $SCRIPT_PATH/esc-oracle/*.js | shasum | cut -c 1-7)"
+        echo "esc-oracle $(cat $SCRIPT_PATH/esc-oracle/*.js | sha256sum | cut -c 1-7)"
     else
         echo "esc-oracle N/A"
     fi
@@ -3830,7 +5332,7 @@ esc-oracle_ver()
 eco-oracle_ver()
 {
     if [ -f $SCRIPT_PATH/eco-oracle/crosschain_eco.js ]; then
-        echo "eco-oracle $(cat $SCRIPT_PATH/eco-oracle/*.js | shasum | cut -c 1-7)"
+        echo "eco-oracle $(cat $SCRIPT_PATH/eco-oracle/*.js | sha256sum | cut -c 1-7)"
     else
         echo "eco-oracle N/A"
     fi
@@ -3839,7 +5341,7 @@ eco-oracle_ver()
 pgp-oracle_ver()
 {
     if [ -f $SCRIPT_PATH/pgp-oracle/crosschain_pgp.js ]; then
-        echo "pgp-oracle $(cat $SCRIPT_PATH/pgp-oracle/*.js | shasum | cut -c 1-7)"
+        echo "pgp-oracle $(cat $SCRIPT_PATH/pgp-oracle/*.js | sha256sum | cut -c 1-7)"
     else
         echo "pgp-oracle N/A"
     fi
@@ -3848,7 +5350,7 @@ pgp-oracle_ver()
 pg-oracle_ver()
 {
     if [ -f $SCRIPT_PATH/pg-oracle/crosschain_pg.js ]; then
-        echo "pg-oracle $(cat $SCRIPT_PATH/pg-oracle/*.js | shasum | cut -c 1-7)"
+        echo "pg-oracle $(cat $SCRIPT_PATH/pg-oracle/*.js | sha256sum | cut -c 1-7)"
     else
         echo "pg-oracle N/A"
     fi
@@ -4013,6 +5515,11 @@ pgp-oracle_remove_log()
     remove_log $SCRIPT_PATH/pgp-oracle/logs/pgp-oracle_out-\*.log
 }
 
+pg-oracle_remove_log()
+{
+    remove_log $SCRIPT_PATH/pg-oracle/logs/pg-oracle_out-\*.log
+}
+
 pg-oracle_update()
 {
     unset OPTIND
@@ -4080,112 +5587,6 @@ esc-oracle_update()
 
     if [ $PID ] && [ "$NO_START_AFTER_UPDATE" == "" ]; then
         esc-oracle_start
-    fi
-}
-
-eco-oracle_update()
-{
-    unset OPTIND
-    while getopts "ny" OPTION; do
-        case $OPTION in
-            n)
-                local NO_START_AFTER_UPDATE=1
-                ;;
-            y)
-                local YES_TO_ALL=1
-                ;;
-        esac
-    done
-
-    chain_prepare_stage eco-oracle '*.js'
-    if [ "$?" != "0" ]; then
-        return
-    fi
-
-    local PATH_STAGE=$SCRIPT_PATH/.node-upload/eco-oracle
-    local DIR_DEPLOY=$SCRIPT_PATH/eco-oracle
-
-    local PID=$(pgrep -fx 'node crosschain_eco.js')
-    if [ $PID ]; then
-        eco-oracle_stop
-    fi
-
-    mkdir -p $DIR_DEPLOY
-    cp -v $PATH_STAGE/*.js $DIR_DEPLOY/
-
-    if [ $PID ] && [ "$NO_START_AFTER_UPDATE" == "" ]; then
-        eco-oracle_start
-    fi
-}
-
-
-pgp-oracle_update()
-{
-    unset OPTIND
-    while getopts "ny" OPTION; do
-        case $OPTION in
-            n)
-                local NO_START_AFTER_UPDATE=1
-                ;;
-            y)
-                local YES_TO_ALL=1
-                ;;
-        esac
-    done
-
-    chain_prepare_stage pgp-oracle '*.js'
-    if [ "$?" != "0" ]; then
-        return
-    fi
-
-    local PATH_STAGE=$SCRIPT_PATH/.node-upload/pgp-oracle
-    local DIR_DEPLOY=$SCRIPT_PATH/pgp-oracle
-
-    local PID=$(pgrep -fx 'node crosschain_pgp.js')
-    if [ $PID ]; then
-        pgp-oracle_stop
-    fi
-
-    mkdir -p $DIR_DEPLOY
-    cp -v $PATH_STAGE/*.js $DIR_DEPLOY/
-
-    if [ $PID ] && [ "$NO_START_AFTER_UPDATE" == "" ]; then
-        pgp-oracle_start
-    fi
-}
-
-pg-oracle_update()
-{
-    unset OPTIND
-    while getopts "ny" OPTION; do
-        case $OPTION in
-            n)
-                local NO_START_AFTER_UPDATE=1
-                ;;
-            y)
-                local YES_TO_ALL=1
-                ;;
-        esac
-    done
-
-    chain_prepare_stage pg-oracle '*.js'
-    if [ "$?" != "0" ]; then
-        return
-    fi
-
-    local PATH_STAGE=$SCRIPT_PATH/.node-upload/pg-oracle
-    local DIR_DEPLOY=$SCRIPT_PATH/pg-oracle
-
-    local PID=$(pgrep -fx 'node crosschain_pg.js')
-    if [ $PID ]; then
-        pg-oracle_stop
-    fi
-
-    mkdir -p $DIR_DEPLOY
-    cp -v $PATH_STAGE/*.js $DIR_DEPLOY/
-
-    if [ $PID ] && [ "$NO_START_AFTER_UPDATE" == "" ]; then
-        pg-oracle_start
     fi
 }
 
@@ -4376,12 +5777,12 @@ EOF
     mkdir -p $SCRIPT_PATH/eid/logs/
 
     if [ -f ~/.config/elastos/eid.txt ]; then
+        warn_hot_miner eid
         if [ -f $SCRIPT_PATH/eid/data/miner_address.txt ]; then
             local EID_OPTS="$EID_OPTS --pbft.miner.address $SCRIPT_PATH/eid/data/miner_address.txt"
         fi
         nohup $SHELL -c "./eid \
             $EID_OPTS \
-            --allow-insecure-unlock \
             --datadir $SCRIPT_PATH/eid/data \
             --mine \
             --miner.threads 1 \
@@ -4391,27 +5792,27 @@ EOF
             --pbft.net.address '$(extip)' \
             --pbft.net.port 20649 \
             --rpc \
-            --rpcaddr '0.0.0.0' \
-            --rpcapi 'db,eth,miner,net,pbft,personal,txpool,web3' \
+            --rpcaddr '$(evm_rpc_bind)' \
+            --rpcapi 'eth,net,web3,txpool,pbft' \
             --rpcvhosts '*' \
             --syncmode full \
-            --unlock '0x$(cat $SCRIPT_PATH/eid/data/keystore/UTC* | jq -r .address)' \
             2>&1 \
-            | rotatelogs $SCRIPT_PATH/eid/logs/eid-%Y-%m-%d-%H_%M_%S.log 20M" &
+            | rotatelogs $SCRIPT_PATH/eid/logs/eid-%Y-%m-%d-%H_%M_%S.log 20M" >/dev/null 2>&1 &
     else
         nohup $SHELL -c "./eid \
             $EID_OPTS \
             --datadir $SCRIPT_PATH/eid/data \
             --lightserv 10 \
             --rpc \
-            --rpcaddr '0.0.0.0' \
-            --rpcapi 'admin,eth,net,txpool,web3' \
+            --rpcaddr '$(evm_rpc_bind)' \
+            --rpcapi 'eth,net,web3,txpool' \
             --rpcvhosts '*' \
             2>&1 \
-            | rotatelogs $SCRIPT_PATH/eid/logs/eid-%Y-%m-%d-%H_%M_%S.log 20M" &
+            | rotatelogs $SCRIPT_PATH/eid/logs/eid-%Y-%m-%d-%H_%M_%S.log 20M" >/dev/null 2>&1 &
     fi
 
     sleep 3
+    verify_started eid
     eid_status
 }
 
@@ -4421,11 +5822,7 @@ eid_stop()
     if [ "$PID" != "" ]; then
         echo "Stopping eid..."
         kill -s SIGINT $PID
-        while ps -p $PID 1>/dev/null; do
-            echo -n .
-            sleep 1
-        done
-        echo
+        wait_stop $PID
     fi
     sync
     eid_status
@@ -4526,20 +5923,20 @@ eid_status()
     local EID_NUM_PEERS=$(eid_jsonrpc \
         '{"jsonrpc":"2.0","method":"net_peerCount","params":[],"id":1}' \
         | jq -r '.result')
-    EID_NUM_PEERS=$(($EID_NUM_PEERS))
+    EID_NUM_PEERS=$(hex_to_dec "$EID_NUM_PEERS")
     if [[ ! "$EID_NUM_PEERS" =~ ^[0-9]+$ ]]; then
-        EID_NUM_PEERS=0
+        EID_NUM_PEERS=N/A
     fi
     local EID_HEIGHT=$(eid_jsonrpc \
         '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' \
         | jq -r '.result')
-    EID_HEIGHT=$(($EID_HEIGHT))
+    EID_HEIGHT=$(hex_to_dec "$EID_HEIGHT")
     if [[ ! "$EID_HEIGHT" =~ ^[0-9]+$ ]]; then
         EID_HEIGHT=N/A
     fi
 
     local EID_BALANCE=$(eid_client \
-        attach --exec "web3.fromWei(eth.getBalance('$EID_ADDRESS'),'ether')")
+        attach --exec "web3.fromWei(eth.getBalance('$EID_ADDRESS'),'ether')" 2>/dev/null)
     if [ "$EID_BALANCE" == "" ]; then
         EID_BALANCE=N/A
     elif [[ $EID_BALANCE =~ [^.0-9e-] ]]; then
@@ -4631,44 +6028,66 @@ eid_init()
         return
     fi
 
+    # Resume support: .init is the single "initialized" marker. An interrupted init may
+    # have created the geth account (and eid.txt) but never reached .init. When the
+    # account already exists we ADOPT it (keystore left untouched); otherwise we clear a
+    # keystore-less leftover password file and create fresh.
     cd ${SCRIPT_PATH}/eid
     local EID_NUM_ACCOUNTS=$(./eid --datadir "$SCRIPT_PATH/eid/data/" \
         --nousb --verbosity 0 account list | wc -l)
+    local EID_ADOPT=
     if [ $EID_NUM_ACCOUNTS -ge 1 ]; then
-        echo_error "eid keystore file exist"
-        return
+        if [ ! -f "$EID_KEYSTORE_PASS_FILE" ]; then
+            echo_error "eid keystore exists but its password file $EID_KEYSTORE_PASS_FILE is missing"
+            echo_error "refusing to touch the keystore - restore the password file or back up eid/data/keystore and re-run init"
+            return
+        fi
+        echo_warn "eid keystore already present - adopting it (resuming an interrupted init; keystore left untouched)"
+        EID_ADOPT=1
+    elif [ -f "$EID_KEYSTORE_PASS_FILE" ]; then
+        echo_warn "clearing partial eid init (password file with no keystore) and starting clean"
+        rm -f "$EID_KEYSTORE_PASS_FILE"
     fi
 
-    if [ -f "$EID_KEYSTORE_PASS_FILE" ]; then
-        echo_error "$EID_KEYSTORE_PASS_FILE exist"
-        return
-    fi
+    if [ -z "$EID_ADOPT" ]; then
+        echo "Creating eid keystore..."
+        gen_pass
+        if [ "$KEYSTORE_PASS" == "" ]; then
+            echo_error "empty password"
+            exit
+        fi
 
-    echo "Creating eid keystore..."
-    gen_pass
-    if [ "$KEYSTORE_PASS" == "" ]; then
-        echo_error "empty password"
-        exit
-    fi
+        echo "Saving eid keystore password..."
+        mkdir -p $(dirname $EID_KEYSTORE_PASS_FILE)
+        chmod 700 $(dirname $EID_KEYSTORE_PASS_FILE)
+        echo $KEYSTORE_PASS > $EID_KEYSTORE_PASS_FILE
+        chmod 600 $EID_KEYSTORE_PASS_FILE
 
-    echo "Saving eid keystore password..."
-    mkdir -p $(dirname $EID_KEYSTORE_PASS_FILE)
-    chmod 700 $(dirname $EID_KEYSTORE_PASS_FILE)
-    echo $KEYSTORE_PASS > $EID_KEYSTORE_PASS_FILE
-    chmod 600 $EID_KEYSTORE_PASS_FILE
-
-    cd ${SCRIPT_PATH}/eid
-    ./eid --datadir "$SCRIPT_PATH/eid/data/" --verbosity 0 account new \
-        --password "$EID_KEYSTORE_PASS_FILE" >/dev/null
-    if [ "$?" != "0" ]; then
-        echo_error "failed to create eid keystore"
-        return
+        cd ${SCRIPT_PATH}/eid
+        ./eid --datadir "$SCRIPT_PATH/eid/data/" --verbosity 0 account new \
+            --password "$EID_KEYSTORE_PASS_FILE" >/dev/null
+        if [ "$?" != "0" ]; then
+            echo_error "failed to create eid keystore"
+            return
+        fi
     fi
 
     echo "Checking eid keystore..."
     local EID_KEYSTORE=$(./eid --datadir "$SCRIPT_PATH/eid/data/" \
         --nousb --verbosity 0 account list | sed 's/.*keystore:\/\///')
     chmod 600 $EID_KEYSTORE
+
+    if [ -n "$EID_ADOPT" ]; then
+        echo "Verifying eid keystore password..."
+        evm_verify_keystore_pass "$SCRIPT_PATH/eid/eid" "$SCRIPT_PATH/eid/data" "$EID_KEYSTORE_PASS_FILE"
+        case $? in
+            0) echo_ok "eid keystore password verified" ;;
+            1) echo_error "the eid password file does not unlock the existing keystore"
+               echo_error "restore the matching password file, or back up + remove eid/data/keystore and re-run init - NOT stamping .init"
+               return ;;
+            *) echo_warn "could not verify the eid keystore password (best-effort check) - continuing; eid reports any real unlock failure at start" ;;
+        esac
+    fi
 
     local EID_MINER_ADDRESS_FILE=$SCRIPT_PATH/eid/data/miner_address.txt
     echo "You can input an alternative eid reward address. (ENTER to skip)"
@@ -4781,9 +6200,10 @@ eid-oracle_start()
     nodejs_setenv
     nohup $SHELL -c "node crosschain_eid.js \
         2>$SCRIPT_PATH/eid-oracle/logs/eid-oracle_err.log \
-        | rotatelogs $SCRIPT_PATH/eid-oracle/logs/eid-oracle_out-%Y-%m-%d-%H_%M_%S.log 20M" &
+        | rotatelogs $SCRIPT_PATH/eid-oracle/logs/eid-oracle_out-%Y-%m-%d-%H_%M_%S.log 20M" >/dev/null 2>&1 &
 
     sleep 1
+    verify_started eid-oracle
     eid-oracle_status
 }
 
@@ -4793,11 +6213,7 @@ eid-oracle_stop()
     if [ "$PID" != "" ]; then
         echo "Stopping eid-oracle..."
         kill $PID
-        while ps -p $PID 1>/dev/null; do
-            echo -n .
-            sleep 1
-        done
-        echo
+        wait_stop $PID $STOP_GRACE_SVC
     fi
     eid-oracle_status
 }
@@ -4814,7 +6230,7 @@ eid-oracle_installed()
 eid-oracle_ver()
 {
     if [ -f $SCRIPT_PATH/eid-oracle/crosschain_eid.js ]; then
-        echo "eid-oracle $(cat $SCRIPT_PATH/eid-oracle/*.js | shasum | cut -c 1-7)"
+        echo "eid-oracle $(cat $SCRIPT_PATH/eid-oracle/*.js | sha256sum | cut -c 1-7)"
     else
         echo "eid-oracle N/A"
     fi
@@ -4971,7 +6387,7 @@ arbiter_start()
         else
             nohup ./arbiter 1>/dev/null 2>output &
         fi
-        echo "Waiting for ela, esc-oracle, eid-oracle, eco-oracle to start..."
+        echo "Waiting for ela, esc-oracle, eid-oracle, pg-oracle to start..."
         sleep 5
     done
 
@@ -4984,11 +6400,7 @@ arbiter_stop()
     if [ "$PID" != "" ]; then
         echo "Stopping arbiter..."
         kill $PID
-        while ps -p $PID 1>/dev/null; do
-            echo -n .
-            sleep 1
-        done
-        echo
+        wait_stop $PID $STOP_GRACE_SVC
     fi
     sync
     arbiter_status
@@ -5337,24 +6749,10 @@ arbiter_init()
         echo_error "eid-oracle not initialized"
         return
     fi
-    #linda添加ECO判断
-     if [ ! -f $SCRIPT_PATH/eco-oracle/.init ]; then
-        echo_error "eco-oracle not initialized"
-        return
-    fi
-    #linda添加
-    #linda添加PGP判断
-     if [ ! -f $SCRIPT_PATH/pgp-oracle/.init ]; then
-        echo_error "pgp-oracle not initialized"
-        return
-    fi
-    #linda添加
-    #linda添加PG判断
     if [ ! -f $SCRIPT_PATH/pg-oracle/.init ]; then
         echo_error "pg-oracle not initialized"
         return
     fi
-    #linda添加
 
 
     local ELA_CONFIG=${SCRIPT_PATH}/ela/config.json
@@ -5417,21 +6815,6 @@ arbiter_init()
         "SupportQuickRecharge": true,
         "SupportInvalidDeposit": true,
         "SupportInvalidWithdraw": true,
-        "PowChain": false
-      },
-      {
-        "Name": "ECO",
-        "Rpc": {
-          "IpAddress": "127.0.0.1",
-          "HttpJsonPort": 20652
-        },
-        "SyncStartHeight": 0,
-        "ExchangeRate": 1,
-        "GenesisBlock": "3043bcc03c90a37a292a4357ee972bc392b143e75e1b79205e113688e3bd071b",
-        "SupportQuickRecharge": true,
-        "SupportInvalidDeposit": true,
-        "SupportInvalidWithdraw": true,
-        "SupportNFT": false,
         "PowChain": false
       },
       {
@@ -5503,21 +6886,6 @@ EOF
         "PowChain": false
       },
       {
-        "Name": "ECO",
-        "Rpc": {
-          "IpAddress": "127.0.0.1",
-          "HttpJsonPort": 20652
-        },
-        "SyncStartHeight": 0,
-        "ExchangeRate": 1,
-        "GenesisBlock": "02820c5adc8ee4fb77aad842ac05d95ed8b1041d80c03ba79f8f11c4af60d87c",
-        "SupportQuickRecharge": true,
-        "SupportInvalidDeposit": true,
-        "SupportInvalidWithdraw": true,
-        "SupportNFT": false,
-        "PowChain": false
-      },
-      {
         "Name": "PG",
         "Rpc": {
           "IpAddress": "127.0.0.1",
@@ -5565,8 +6933,8 @@ EOF
 
     # Arbiter Config: Arbiter RPC
     echo "Generating random userpass for arbiter RPC interface..."
-    local ARBITER_RPC_USER=$(openssl rand -base64 100 | shasum | head -c 32)
-    local ARBITER_RPC_PASS=$(openssl rand -base64 100 | shasum | head -c 32)
+    local ARBITER_RPC_USER=$(openssl rand -base64 100 | sha256sum | head -c 32)
+    local ARBITER_RPC_PASS=$(openssl rand -base64 100 | sha256sum | head -c 32)
 
     echo "Updating arbiter config file..."
     jq ".Configuration.MainNode.Rpc.User=\"$ELA_RPC_USER\"              | \
@@ -5586,45 +6954,163 @@ EOF
     echo
 }
 
-usage()
+# chain_help <chain>: the real per-chain command list (replaces the stale *_usage).
+chain_help()
 {
-    echo "Usage: $SCRIPT_NAME [CHAIN] COMMAND [OPTIONS]"
-    echo "Manage Elastos Node"
+    local chain=$1
+    echo "Usage:  $SCRIPT_NAME $chain <command> [options]"
     echo
-    echo "Diag Info:"
+    echo "  start   stop   restart   status [--json]   health   logs [-f]"
+    echo "  client   rpc   init   update   version"
+    case "$chain" in
+        ela)
+            echo "  send           transfer"
+            echo "  governance:    register-bpos activate-bpos unregister-bpos vote-bpos"
+            echo "                 stake-bpos unstake-bpos claim-bpos register-crc activate-crc unregister-crc"
+            ;;
+        esc|eid|pg)
+            echo "  reward:        set a cold mining address via  $SCRIPT_NAME reward set 0x.."
+            ;;
+        eco)
+            echo "  purge:         stop eco + eco-oracle and DELETE their data (chain is decommissioned)"
+            ;;
+    esac
     echo
-    echo "  Deploy Path:    $SCRIPT_PATH"
-    echo "  Script SHA1:    $SCRIPT_SHA1"
-    echo "  Chains Type:    $CHAIN_TYPE"
-    echo
-    echo "Available Chains:"
-    echo
-    for i in $(grep "^[^ ]\+_ver(" $BASH_SOURCE | sed 's/(.*$//'); do
-    printf "  %-16s%s\n" $(${i})
-    done
-    echo
+    echo "  aliases: up=start   down=stop   rpc=jsonrpc   (kebab-case accepted)"
 }
 
+usage()
+{
+    echo "Elastos Node for Ubuntu v$ELASTOS_NODE_VERSION"
+    echo
+    echo "Usage:  $SCRIPT_NAME <command> [options]"
+    echo "        $SCRIPT_NAME <chain> <command> [options]"
+    echo
+    echo "DAILY"
+    echo "  start | stop       start / stop every chain in the profile"
+    echo "  summary            one row per chain: state, height, peers (add --json)"
+    echo "  status             full status for the profile (--verbose for everything)"
+    echo "  logs [chain] [-f]  tail a chain's log"
+    echo "  health             exit-code health check (0 = all healthy; cron-friendly)"
+    echo
+    echo "SETUP   (install deps first: sudo apt-get install -y jq lsof apache2-utils curl openssl)"
+    echo "  init               initialize the node: download binaries + create keystores"
+    echo "  setup              alias for init, with a guided 'next steps' summary"
+    echo "  profile [set P]    choose what this node runs (mainchain | full)"
+    echo "  swap               (optional) add 16G swap headroom for the initial sync"
+    echo "  firewall           open peer/consensus ports - detects your SSH port, asks before enabling"
+    echo "  set_cron           enable autostart on reboot + log compression"
+    echo "  harden             close public RPC ports + report any restart needed"
+    echo "  monitor <url>      report status to a read-only monitor (push; no RPC password, no open port)"
+    echo "  reward [set 0x..]  cold miner reward address for the side chains"
+    echo
+    echo "MANAGE"
+    echo "  restart            restart the profile's chains, one at a time (ela needs --force)"
+    echo "  update             update the chain binaries"
+    echo "  migrate            move an existing install onto this tool (--dry-run | --apply)"
+    echo "  uninstall          stop + remove the install (keystore backed up)"
+    echo "  version | -v       tool + chain versions"
+    echo
+    echo "PER-CHAIN    $SCRIPT_NAME <chain> <command>"
+    echo "  start stop restart status [--json] health logs [-f] client rpc init update version"
+    echo "  run '$SCRIPT_NAME <chain>' for that chain's full list (ela: governance; eco: purge)"
+    echo
+    echo "CHAINS       $(profile_chains 2>/dev/null || echo 'ela esc eid pg + oracles + arbiter')"
+    echo "ALIASES      up=start   down=stop   ps=summary   rpc=jsonrpc   (kebab-case accepted)"
+    echo "MAINTAIN     update_script   set_path"
+    echo "FLAGS        --profile <mainchain|full>   --no-color"
+    echo
+    ui_dim "  deploy:$SCRIPT_PATH  sha:$SCRIPT_SHA1  network:$CHAIN_TYPE"; echo
+}
 #
 # Main
 #
-SCRIPT_PATH=$(cd $(dirname $BASH_SOURCE); pwd)
+SCRIPT_PATH=$(cd "$(dirname "$(readlink -f "$BASH_SOURCE" 2>/dev/null || echo "$BASH_SOURCE")")" && pwd)
 SCRIPT_NAME=$(basename $BASH_SOURCE)
-SCRIPT_SHA1=$(shasum $BASH_SOURCE | cut -c1-7)
+SCRIPT_SHA1=$(sha256sum $BASH_SOURCE | cut -c1-7)
 
 set_env
+
 check_env
 load_config
+
+# global flag: --profile <mainchain|full> overrides the persisted profile for this run
+PROFILE_OVERRIDE=
+UI_NO_COLOR=
+while true; do
+    case "$1" in
+        --profile)  [ $# -ge 2 ] || { echo_error "--profile needs a value (mainchain|full)"; exit 1; }
+                    PROFILE_OVERRIDE="$2"; shift 2 ;;
+        --no-color) UI_NO_COLOR=1; shift ;;
+        *) break ;;
+    esac
+done
+
+# modern verb aliases -> canonical command (old commands unchanged)
+case "$1" in
+    up)   set -- start "${@:2}" ;;
+    down) set -- stop "${@:2}" ;;
+    ps)   set -- summary "${@:2}" ;;
+esac
 
 # script commands
 if [ "$1" == "" ]; then
     usage
+    exit
+elif [ "$1" == "help" ] || [ "$1" == "-h" ] || [ "$1" == "--help" ]; then
+    usage
+    exit
+elif [ "$1" == "profile" ]; then
+    profile "$2" "$3"
+    exit
+elif [ "$1" == "summary" ]; then
+    if [ "$2" == "--json" ]; then render_json_all; else render_summary; fi
+    exit
+elif [ "$1" == "status" ]; then
+    if [ "$2" == "--verbose" ] || [ "$2" == "-v" ] || [ "$2" == "--all" ]; then all_status; else render_status_all; fi
+    exit
+elif [ "$1" == "health" ]; then
+    render_health_all
+    exit $?
+elif [ "$1" == "restart" ]; then
+    case "$2" in --force|--include-ela) FORCE_ELA=1 ;; esac
+    all_restart
+    exit
+elif [ "$1" == "logs" ]; then
+    logs_cmd "$2" "$3"
+    exit
+elif [ "$1" == "version" ] || [ "$1" == "--version" ] || [ "$1" == "-v" ]; then
+    version_cmd
+    exit
+elif [ "$1" == "reward" ]; then
+    reward_cmd "$2" "$3"
+    exit
+elif [ "$1" == "uninstall" ]; then
+    uninstall_cmd
+    exit
+elif [ "$1" == "migrate" ]; then
+    migrate "$2" "$3"
+    exit $?
+elif [ "$1" == "setup" ]; then
+    setup
+    exit
+elif [ "$1" == "firewall" ]; then
+    firewall
+    exit
+elif [ "$1" == "harden" ]; then
+    harden
+    exit
+elif [ "$1" == "monitor" ]; then
+    monitor_cmd "${@:2}"
     exit
 elif [ "$1" == "set_path" ]; then
     set_path
     exit
 elif [ "$1" == "set_cron" ]; then
     set_cron
+    exit
+elif [ "$1" == "swap" ]; then
+    swap
     exit
 elif [ "$1" == "update_script" ] || [ "$1" == "script_update" ]; then
     update_script
@@ -5662,22 +7148,41 @@ else
        [ "$1" != "pg"         ] && \
        [ "$1" != "pg-oracle"  ] && \
        [ "$1" != "arbiter"    ]; then
-        echo_error "do not support chain: $1"
-        exit
+        echo_error "unknown command or chain: $1"
+        echo "  run '$SCRIPT_NAME help' for the full list"
+        did_you_mean "$1" "up down restart ps status summary health logs version setup init swap start stop update profile firewall harden monitor set_cron reward uninstall ela esc eid pg arbiter"
+        exit 1
     fi
     CHAIN_NAME=$1
     CHAIN_NAME_U=$(echo $CHAIN_NAME | tr "[:lower:]" "[:upper:]")
 
+    # modern per-chain verbs + kebab-case -> canonical command (old commands unchanged)
+    _CMD=$2
+    case "$_CMD" in
+        up)   _CMD=start ;;
+        down) _CMD=stop ;;
+        ps)   _CMD=status ;;
+        rpc)  _CMD=jsonrpc ;;
+    esac
+    _CMD=${_CMD//-/_}
+    if [ -n "$2" ] && [ "$_CMD" != "$2" ]; then set -- "$1" "$_CMD" "${@:3}"; fi
+
     if [ "$2" == "" ]; then
-        # no command specified
-        COMMAND=usage
+        # no command: show this chain's commands and exit non-zero (not a silent success)
+        chain_help "$CHAIN_NAME"
+        exit 1
     elif [ "$2" == "start"   ] || \
          [ "$2" == "stop"    ] || \
          [ "$2" == "status"  ] || \
+         [ "$2" == "health"  ] || \
+         [ "$2" == "restart" ] || \
+         [ "$2" == "logs"    ] || \
+         [ "$2" == "version" ] || \
          [ "$2" == "client"  ] || \
          [ "$2" == "jsonrpc" ] || \
          [ "$2" == "update"  ] || [ "$2" == "upgrade" ] || \
          [ "$2" == "init"    ] || \
+         [ "$2" == "purge"   ] || \
          [ "$2" == "register_bpos"   ] || \
          [ "$2" == "activate_bpos"   ] || \
          [ "$2" == "unregister_bpos" ] || \
@@ -5696,8 +7201,10 @@ else
          [ "$2" == "remove_log"      ]; then
         COMMAND=$2
     else
-        echo_error "do not support command: $2"
-        exit
+        echo_error "unknown command: $2"
+        echo "  run '$SCRIPT_NAME $CHAIN_NAME' to see $CHAIN_NAME commands"
+        did_you_mean "$2" "up down restart start stop status health logs init update client rpc jsonrpc send transfer version register_bpos activate_bpos vote_bpos stake_bpos claim_bpos"
+        exit 1
     fi
     # command aliases
     if [ "$COMMAND" == "upgrade" ]; then
@@ -5705,6 +7212,36 @@ else
     fi
 
     shift 2
+
+    if [ "$COMMAND" == "purge" ] && [ "$CHAIN_NAME" != "eco" ]; then
+        echo_error "purge is only available for the decommissioned eco chain"
+        exit 1
+    fi
+    if [ "$COMMAND" == "status" ]; then
+        case "$1" in
+            --verbose|-v|--all) ${CHAIN_NAME}_status ;;
+            --json)             render_json_one $CHAIN_NAME ;;
+            *)                  render_status_one $CHAIN_NAME ;;
+        esac
+        exit
+    fi
+    if [ "$COMMAND" == "health" ]; then
+        render_health $CHAIN_NAME
+        exit $?
+    fi
+    if [ "$COMMAND" == "restart" ]; then
+        case "$1" in --force|--include-ela) FORCE_ELA=1 ;; esac
+        chain_restart $CHAIN_NAME
+        exit $?
+    fi
+    if [ "$COMMAND" == "logs" ]; then
+        chain_logs $CHAIN_NAME "$@"
+        exit $?
+    fi
+    if [ "$COMMAND" == "version" ]; then
+        "${CHAIN_NAME}_ver" 2>/dev/null || echo_error "no version for $CHAIN_NAME"
+        exit
+    fi
 
     ${CHAIN_NAME}_${COMMAND} "$@"
 fi
